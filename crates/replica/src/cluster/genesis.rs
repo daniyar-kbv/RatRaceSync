@@ -1,5 +1,6 @@
 use super::*;
 use rusqlite::OptionalExtension;
+mod recovery;
 
 const CREATE: [u8; 16] = [1, 1, 1, 1, 1, 1, 0x41, 1, 0x81, 1, 1, 1, 1, 1, 1, 1];
 
@@ -54,6 +55,16 @@ fn game_file(dir: &Path, id: ReplicaId) -> std::path::PathBuf {
     dir.join(format!("game-{id}-g1.sqlite"))
 }
 
+fn interrupted(dir: &Path, stage: u8) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "cluster::genesis::interrupted_create_worker"])
+        .env("GENESIS_FIXTURE_DIRECTORY", dir)
+        .env("GENESIS_FIXTURE_STAGE", stage.to_string())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(90 + i32::from(stage)));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interrupted_create_worker() {
     let Some(dir) = std::env::var_os("GENESIS_FIXTURE_DIRECTORY") else {
@@ -73,15 +84,9 @@ async fn interrupted_create_worker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_durable_create_boundary_recovers_one_game_and_one_original_root() {
-    for stage in 1..=7 {
+    for stage in 1..=8 {
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "cluster::genesis::interrupted_create_worker"])
-            .env("GENESIS_FIXTURE_DIRECTORY", dir.path())
-            .env("GENESIS_FIXTURE_STAGE", stage.to_string())
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(90 + stage));
+        interrupted(dir.path(), stage);
         let (session, id, original_pin) = catalog_row(dir.path());
         assert_eq!(original_pin.is_some(), stage == 5);
         let path = game_file(dir.path(), id);
@@ -218,13 +223,7 @@ async fn a_valid_same_session_substitute_cannot_replace_the_installed_pin() {
     original.node.raft.shutdown().await.unwrap();
     drop(original);
     // Stage an independent, legitimate Create in a separate installation using the same session ID.
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "cluster::genesis::interrupted_create_worker"])
-        .env("GENESIS_FIXTURE_DIRECTORY", second.path())
-        .env("GENESIS_FIXTURE_STAGE", "1")
-        .status()
-        .unwrap();
-    assert_eq!(status.code(), Some(91));
+    interrupted(second.path(), 1);
     Connection::open(second.path().join("installation.sqlite"))
         .unwrap()
         .execute("UPDATE participation SET session=?", [&session])
@@ -340,13 +339,7 @@ async fn pinned_game_rejects_damaged_or_missing_evidence_without_resigning() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prepared_game_with_a_lost_local_identity_stays_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "cluster::genesis::interrupted_create_worker"])
-        .env("GENESIS_FIXTURE_DIRECTORY", dir.path())
-        .env("GENESIS_FIXTURE_STAGE", "3")
-        .status()
-        .unwrap();
-    assert_eq!(status.code(), Some(93));
+    interrupted(dir.path(), 3);
     let (_, id, pin) = catalog_row(dir.path());
     assert!(pin.is_none());
     let db = Connection::open(game_file(dir.path(), id)).unwrap();

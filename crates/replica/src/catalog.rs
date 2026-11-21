@@ -67,10 +67,19 @@ impl InstallationCatalog {
         if path.is_symlink() {
             return Err(invalid("invalid installation catalog path"));
         }
+        check_sqlite_files(&path)?;
         if !path.exists() {
             ensure_empty_inventory(&directory)?
         }
         let db = Connection::open(&path).map_err(io::Error::other)?;
+        let version = database_version(&db)?;
+        match version {
+            0 => ensure_empty_inventory(&directory)?,
+            1 => {
+                Self::reservation(&db)?;
+            }
+            _ => return Err(invalid("unsupported installation catalog")),
+        }
         let mode: String = db
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .map_err(io::Error::other)?;
@@ -79,11 +88,7 @@ impl InstallationCatalog {
         }
         db.execute_batch("PRAGMA synchronous=FULL")
             .map_err(io::Error::other)?;
-        let version: i32 = db
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(io::Error::other)?;
         if version == 0 {
-            ensure_empty_inventory(&directory)?;
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE participation (
                     slot INTEGER PRIMARY KEY CHECK(slot=1), request BLOB NOT NULL CHECK(length(request)=16),
@@ -93,8 +98,6 @@ impl InstallationCatalog {
                     CHECK((stage<2 AND pin IS NULL) OR (stage=2 AND pin IS NOT NULL AND length(pin)=32))
                 ) STRICT;
                 PRAGMA user_version=1; COMMIT").map_err(io::Error::other)?;
-        } else if version != 1 {
-            return Err(invalid("unsupported installation catalog"));
         }
         Ok(Self {
             directory,
@@ -212,9 +215,14 @@ impl InstallationCatalog {
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
         if let Some(node) = self.running.upgrade() {
-            let pin = node.replica.root(&r.creator, None)?;
-            if Some(pin) != r.pin {
+            let pin = r.pin.ok_or(invalid("live game requires an active pin"))?;
+            if node.replica.session != r.session
+                || node.replica.root(&r.creator, None)? != Some(pin)
+            {
                 return Err(invalid("active catalog pin mismatch"));
+            }
+            if !node.raft.is_initialized().await.map_err(io::Error::other)? {
+                return Err(invalid("active game has no initialized Raft node"));
             }
             return Ok(CreatorGame {
                 node,
@@ -228,12 +236,15 @@ impl InstallationCatalog {
             return Err(invalid("invalid game generation path"));
         }
         let replica = Replica::open_game(&path, &r.session, Some(&r.creator), !r.prepared)?;
-        if let Some(pin) = r.pin
-            && replica.root(&r.creator, None)? != pin
-        {
+        // A pending reservation may already own a signed record. Verify it
+        // before Raft can campaign or append on a recovered generation.
+        let original = replica.root(&r.creator, None)?;
+        if r.pin.is_some() && original != r.pin {
             return Err(invalid("game genesis does not match catalog pin"));
         }
         if !r.prepared {
+            #[cfg(test)]
+            self.interrupt_at(8); // Game file durable, catalog still reserved.
             let updated = self
                 .db
                 .execute(
@@ -300,7 +311,10 @@ impl InstallationCatalog {
             .map_err(io::Error::other)?;
         #[cfg(test)]
         self.interrupt_at(3);
-        let pin = node.replica.root(&r.creator, key)?;
+        let pin = node
+            .replica
+            .root(&r.creator, key)?
+            .ok_or(invalid("original genesis certificate missing"))?;
         #[cfg(test)]
         self.interrupt_at(4);
         // Pin and activate generation one in a single catalog commit. No update

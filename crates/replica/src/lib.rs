@@ -23,6 +23,61 @@ pub use wire::{Applied, Command};
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+// Opening a new main file can cause SQLite to discard an older journal at
+// that path. Preserve the surviving files for explicit recovery.
+fn check_sqlite_files(path: &Path) -> io::Result<()> {
+    if !path.try_exists()? {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut journal = path.as_os_str().to_owned();
+            journal.push(suffix);
+            match std::fs::symlink_metadata(journal) {
+                Ok(_) => return Err(invalid("missing database with surviving SQLite files")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+// SQLite uses version zero for both an empty database and an application
+// that never set user_version. Only the former is available for provisioning.
+fn database_version(db: &Connection) -> io::Result<i32> {
+    let version = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(io::Error::other)?;
+    if version == 0 {
+        let occupied: bool = db
+            .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |row| {
+                row.get(0)
+            })
+            .map_err(io::Error::other)?;
+        if occupied {
+            return Err(invalid("unrecognized database at reserved path"));
+        }
+    }
+    Ok(version)
+}
+
+fn verify_game_identity(
+    db: &Connection,
+    session: &[u8],
+    creator: Option<&genesis::Creator>,
+) -> io::Result<()> {
+    if store::meta::<Vec<u8>>(db, "session")?.as_deref() != Some(session)
+        || store::meta::<genesis::Creator>(db, "creator")?.as_ref() != creator
+    {
+        return Err(invalid("unexpected game database identity"));
+    }
+    if let Some(creator) = creator
+        && store::meta::<ReplicaId>(db, "local_node")? != Some(creator.node)
+    {
+        return Err(invalid("original creator replica binding missing"));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Replica {
     db: Arc<Mutex<Connection>>,
@@ -62,11 +117,17 @@ impl Replica {
             .truncate(false)
             .open(lock_name)?;
         writer.try_lock().map_err(io::Error::other)?;
+        check_sqlite_files(&path)?;
         let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
         if allow_create {
             flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         }
         let mut db = Connection::open_with_flags(path, flags).map_err(io::Error::other)?;
+        let version = database_version(&db)?;
+        let expected_version = if creator.is_some() { 2 } else { 1 };
+        if version != expected_version && !(version == 0 && allow_create) {
+            return Err(invalid("unexpected game database version"));
+        }
         let mode: String = db
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .map_err(io::Error::other)?;
@@ -78,11 +139,7 @@ impl Replica {
         let tx = db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(io::Error::other)?;
-        let version: i32 = tx
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .map_err(io::Error::other)?;
-        let expected_version = if creator.is_some() { 2 } else { 1 };
-        if version == 0 && allow_create {
+        if version == 0 {
             tx.execute_batch(include_str!("schema.sql"))
                 .map_err(io::Error::other)?;
             store::put(&tx, "session", &session)?;
@@ -92,17 +149,8 @@ impl Replica {
             }
             tx.pragma_update(None, "user_version", expected_version)
                 .map_err(io::Error::other)?;
-        } else if version != expected_version
-            || store::meta::<genesis::Creator>(&tx, "creator")?.as_ref() != creator
-            || store::meta::<Vec<u8>>(&tx, "session")?.as_deref() != Some(session)
-        {
-            return Err(invalid("unexpected database identity or version"));
         }
-        if let Some(c) = creator
-            && store::meta::<ReplicaId>(&tx, "local_node")? != Some(c.node)
-        {
-            return Err(invalid("original creator replica binding missing"));
-        }
+        verify_game_identity(&tx, session, creator)?;
         tx.commit().map_err(io::Error::other)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
