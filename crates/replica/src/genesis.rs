@@ -114,7 +114,7 @@ impl Replica {
             (2, b"opaque-id-1"),
             (3, b"Classic101-rules-1"),
             (4, b"Classic101-content-1"),
-            (5, wire::PROFILE),
+            (5, self.profile()),
             (6, b"whole-usd-128-decimal-digits-1"),
         ]);
         Ok(wire::message(&[

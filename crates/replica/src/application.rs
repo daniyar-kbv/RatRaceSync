@@ -62,8 +62,8 @@ impl Replica {
         let last = meta::<LogId>(db, "applied")?;
         let checkpoint=db.query_row("SELECT log_id,event_count,event_tip,receipt_count,receipt_tip FROM archive ORDER BY idx DESC LIMIT 1",[],|r|
             Ok((r.get::<_,Vec<u8>>(0)?,(r.get::<_,i64>(1)?,r.get::<_,Vec<u8>>(2)?),(r.get::<_,i64>(3)?,r.get::<_,Vec<u8>>(4)?)))).optional().map_err(io::Error::other)?;
-        let events = tip(db, "event", &self.session)?;
-        let receipts = tip(db, "receipt", &self.session)?;
+        let events = self.tip(db, "event")?;
+        let receipts = self.tip(db, "receipt")?;
         match (last, checkpoint) {
             (Some(k), Some((stored, e, r)))
                 if stored == log_key(k) && e == events && r == receipts =>
@@ -223,6 +223,9 @@ impl Replica {
     pub(crate) fn preflight(&self, signed: &Signed) -> io::Result<Option<Reply>> {
         let db = self.lock()?;
         self.verify_checkpoint(&db)?;
+        if self.lobby_enabled {
+            return self.inspect_lobby(&db, signed);
+        }
         let (c, reply) = self.inspect(&db, &signed.0)?;
         if reply.is_none() {
             let observed = self.verify_observation(&db, &c)?;
@@ -280,7 +283,7 @@ impl Replica {
                 (7, &data),
                 (8, parent),
             ]);
-            let prev = tip(tx, "event", &c.session)?.1;
+            let prev = self.tip(tx, "event")?.1;
             let next = hash(
                 b"event-step",
                 &[
@@ -310,34 +313,20 @@ impl Replica {
             refs.extend(id);
             message(&[(11, &message(&[(109, &data)]))])
         };
-        let (prev_seq, prev) = tip(tx, "receipt", &c.session)?;
+        let (prev_seq, prev) = self.tip(tx, "receipt")?;
         let seq = prev_seq.checked_add(1).ok_or(invalid("receipt range"))?;
-        let record = message(&[
-            (1, &c.session),
-            (2, &c.actor),
-            (3, &c.request),
-            (4, &fp),
-            (5, k),
-            (6, &seq.to_be_bytes()),
-            (7, &outcome),
-            (8, &refs),
-            (9, parent),
-        ]);
-        let next = hash(
-            b"receipt-step",
-            &[
-                &prev,
-                &c.session,
-                &c.actor,
-                &c.request,
-                &fp,
-                k,
-                &seq.to_be_bytes(),
-                &refs,
-                parent,
-                &outcome_digest(&outcome)?,
-            ],
-        );
+        let (record, next) = ReceiptRecord {
+            session: &c.session,
+            actor: &c.actor,
+            request: &c.request,
+            fingerprint: &fp,
+            log: k,
+            seq,
+            outcome: &outcome,
+            refs: &refs,
+            source_digest: parent,
+        }
+        .encode(&prev, &outcome_digest(&outcome)?);
         tx.execute(
             "INSERT INTO receipt VALUES(?,?,?,?,?,?)",
             params![seq, c.actor, c.request, fp, record, next],
@@ -348,6 +337,12 @@ impl Replica {
     fn apply_entry(&self, e: Entry) -> io::Result<Reply> {
         let mut db = self.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
+        // A duplicate can already be committed when a retry bypasses preflight.
+        // Check the pre-entry state inside this transaction before acknowledging
+        // any stored Create outcome. Scratch replay calls apply_in_transaction.
+        if self.lobby_enabled && e.payload.bytes.first() == Some(&1) {
+            self.verify_replay(&tx)?;
+        }
         let reply = self.apply_in_transaction(&tx, &e)?;
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&1)
@@ -425,12 +420,16 @@ impl Replica {
         } else if src == &[0] {
             Reply::Protocol
         } else if let Some(raw) = src.strip_prefix(&[1]) {
-            self.apply_command(tx, &k, raw, &digest)?
+            if self.lobby_enabled {
+                self.apply_lobby(tx, &k, raw, &digest)?
+            } else {
+                self.apply_command(tx, &k, raw, &digest)?
+            }
         } else {
             return Err(invalid("unknown raft source"));
         };
-        let (events, et) = tip(tx, "event", &self.session)?;
-        let (receipts, rt) = tip(tx, "receipt", &self.session)?;
+        let (events, et) = self.tip(tx, "event")?;
+        let (receipts, rt) = self.tip(tx, "receipt")?;
         tx.execute(
             "INSERT INTO archive VALUES(?,?,?,?,?,?,?,?)",
             params![
@@ -640,22 +639,71 @@ fn outcome_digest(outcome: &[u8]) -> io::Result<[u8; 32]> {
     }
     Ok(economic_transcript(&decoded))
 }
-fn tip(db: &Connection, kind: &str, session: &[u8]) -> io::Result<(i64, Vec<u8>)> {
-    let sql = match kind {
-        "event" => "SELECT seq,tip FROM event ORDER BY seq DESC LIMIT 1",
-        "receipt" => "SELECT seq,tip FROM receipt ORDER BY seq DESC LIMIT 1",
-        _ => unreachable!(),
-    };
-    Ok(db
-        .query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
-        .map_err(io::Error::other)?
-        .unwrap_or_else(|| {
-            (
-                0,
-                hash(b"genesis", &[wire::PROFILE, session, kind.as_bytes()]).to_vec(),
-            )
-        }))
+pub(crate) struct ReceiptRecord<'a> {
+    pub session: &'a [u8],
+    pub actor: &'a [u8],
+    pub request: &'a [u8],
+    pub fingerprint: &'a [u8],
+    pub log: &'a [u8],
+    pub seq: i64,
+    pub outcome: &'a [u8],
+    pub refs: &'a [u8],
+    pub source_digest: &'a [u8],
+}
+impl ReceiptRecord<'_> {
+    pub fn encode(&self, previous_tip: &[u8], outcome_digest: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        let seq = self.seq.to_be_bytes();
+        let record = message(&[
+            (1, self.session),
+            (2, self.actor),
+            (3, self.request),
+            (4, self.fingerprint),
+            (5, self.log),
+            (6, &seq),
+            (7, self.outcome),
+            (8, self.refs),
+            (9, self.source_digest),
+        ]);
+        let tip = hash(
+            b"receipt-step",
+            &[
+                previous_tip,
+                self.session,
+                self.actor,
+                self.request,
+                self.fingerprint,
+                self.log,
+                &seq,
+                self.refs,
+                self.source_digest,
+                outcome_digest,
+            ],
+        );
+        (record, tip)
+    }
+}
+impl Replica {
+    pub(crate) fn tip(&self, db: &Connection, kind: &str) -> io::Result<(i64, Vec<u8>)> {
+        let sql = match kind {
+            "event" => "SELECT seq,tip FROM event ORDER BY seq DESC LIMIT 1",
+            "receipt" => "SELECT seq,tip FROM receipt ORDER BY seq DESC LIMIT 1",
+            _ => unreachable!(),
+        };
+        Ok(db
+            .query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(io::Error::other)?
+            .unwrap_or_else(|| {
+                (
+                    0,
+                    hash(
+                        b"genesis",
+                        &[self.profile(), &self.session, kind.as_bytes()],
+                    )
+                    .to_vec(),
+                )
+            }))
+    }
 }
 impl RaftStateMachine<Types> for Replica {
     type SnapshotData = ();

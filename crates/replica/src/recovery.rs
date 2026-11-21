@@ -14,9 +14,7 @@ impl Replica {
         // An unnamed SQLite file is temporary, can spill to disk, and is deleted
         // on close. No verification write touches the game database.
         let mut scratch = Connection::open("").map_err(io::Error::other)?;
-        scratch
-            .execute_batch(include_str!("schema.sql"))
-            .map_err(io::Error::other)?;
+        store::create_schema(&scratch, self.lobby_enabled)?;
         let replay = scratch.transaction().map_err(io::Error::other)?;
         seed_opening_state(db, &replay)?;
         if let Some(k) = last {
@@ -46,7 +44,7 @@ impl Replica {
             "SELECT * FROM receipt ORDER BY seq",
             "SELECT * FROM participant ORDER BY actor",
             "SELECT * FROM certificate ORDER BY actor,position",
-            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log') ORDER BY name",
+            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby') ORDER BY name",
         ] {
             if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
                 return Err(invalid(

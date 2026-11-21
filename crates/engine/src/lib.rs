@@ -1,7 +1,9 @@
 //! Deterministic financial operations over authoritative game state.
 
 mod integer;
+mod lobby;
 pub use integer::{Integer, InvalidInteger};
+pub use lobby::LobbyCapacity;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
