@@ -137,8 +137,10 @@ impl Replica {
                 return Err(invalid("invalid receipt sequence"));
             }
             let f = fields(&record, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
-            let (source,digest,checkpoint):(Vec<u8>,Vec<u8>,Vec<u8>)=db.query_row(
-                "SELECT source,digest,receipt_tip FROM archive WHERE log_id=? AND receipt_count=?",params![f[&5],seq],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(io::Error::other)?;
+            let (source, digest, checkpoint, event_seq, event_tip): (Vec<u8>,Vec<u8>,Vec<u8>,i64,Vec<u8>) = db.query_row(
+                "SELECT source,digest,receipt_tip,event_count,event_tip FROM archive WHERE log_id=? AND receipt_count=?",
+                params![f[&5],seq], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))
+            ).map_err(io::Error::other)?;
             let previous = if seq == 1 {
                 hash(b"genesis", &[wire::PROFILE, &self.session, b"receipt"]).to_vec()
             } else {
@@ -162,7 +164,14 @@ impl Replica {
                     &outcome_digest(f[&7])?,
                 ],
             );
-            if f[&1] != c.session
+            // Incoming signed fields may be reordered. The stored receipt was
+            // emitted in one canonical order and retries must return those exact bytes.
+            let mut canonical = Vec::with_capacity(record.len());
+            for (&tag, &value) in &f {
+                wire::field(&mut canonical, tag, value);
+            }
+            if canonical != record
+                || f[&1] != c.session
                 || f[&2] != c.actor
                 || f[&3] != c.request
                 || f[&4] != fp
@@ -174,6 +183,18 @@ impl Replica {
             {
                 return Err(invalid("original receipt integrity mismatch"));
             }
+            let signed = source
+                .strip_prefix(&[1])
+                .ok_or(invalid("unexpected receipt source"))?;
+            let original = Command::parse(fields(signed, &[1, 2])?[&1])?;
+            if original.fingerprint().as_slice() != fp
+                || original.actor != c.actor
+                || original.request != c.request
+                || original.session != self.session
+            {
+                return Err(invalid("original request mismatch"));
+            }
+            verify_linked_event(db, &original, &f, event_seq, &event_tip)?;
             Some(if fp == c.fingerprint() {
                 Reply::Receipt(record)
             } else {
@@ -204,10 +225,11 @@ impl Replica {
         self.verify_checkpoint(&db)?;
         let (c, reply) = self.inspect(&db, &signed.0)?;
         if reply.is_none() {
-            self.verify_observation(&db, &c)?;
+            let observed = self.verify_observation(&db, &c)?;
             if material(&db, &c.actor, &c.position, last_event(&db)?)?.digest != c.guard {
                 return Err(invalid("stale observation"));
             }
+            plan_redemption(&db, &c, &observed)?;
         }
         Ok(reply)
     }
@@ -227,9 +249,22 @@ impl Replica {
         let fp = c.fingerprint();
         let mut refs = vec![];
         let outcome = if old.digest != current.digest {
+            // A delayed request must have been economically possible at its observation.
+            let income = historical_income(tx, &c.actor, c.observed)?;
+            calculate_redemption(&c, &old, number(&income)?)?;
             message(&[(13, &[8, 1])])
         } else {
-            let applied = reduce(tx, &c, &current)?;
+            let applied = plan_redemption(tx, &c, &current)?;
+            tx.execute(
+                "UPDATE participant SET cash=?,monthly=? WHERE actor=?",
+                params![applied.cash_after, applied.total_income_after, c.actor],
+            )
+            .map_err(io::Error::other)?;
+            tx.execute(
+                "UPDATE certificate SET units=? WHERE actor=? AND position=?",
+                params![applied.units_after, c.actor, c.position],
+            )
+            .map_err(io::Error::other)?;
             let data = applied.encode_to_vec();
             let seq = last_event(tx)?
                 .checked_add(1)
@@ -313,8 +348,30 @@ impl Replica {
     fn apply_entry(&self, e: Entry) -> io::Result<Reply> {
         let mut db = self.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
-        self.verify_checkpoint(&tx)?;
-        let prev = meta::<LogId>(&tx, "applied")?;
+        let reply = self.apply_in_transaction(&tx, &e)?;
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&1)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 1
+        {
+            std::process::exit(81)
+        }
+        tx.commit().map_err(io::Error::other)?;
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&1)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
+        {
+            std::process::exit(82)
+        }
+        Ok(reply)
+    }
+
+    pub(crate) fn apply_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        e: &Entry,
+    ) -> io::Result<Reply> {
+        self.verify_checkpoint(tx)?;
+        let prev = meta::<LogId>(tx, "applied")?;
         if prev.map(|id| id.index.checked_add(1)).unwrap_or(Some(0)) != Some(e.log_id.index) {
             return Err(invalid("noncontiguous apply"));
         }
@@ -330,7 +387,7 @@ impl Replica {
                 .map_err(io::Error::other)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(io::Error::other)?;
-            if meta::<StoredMembershipOf<Types>>(&tx, "membership")?.is_some()
+            if meta::<StoredMembershipOf<Types>>(tx, "membership")?.is_some()
                 || m.get_joint_config().len() != 1
                 || !(2..=10).contains(&m.voter_ids().count())
                 || m.non_write_voter_ids().next().is_some()
@@ -339,7 +396,7 @@ impl Replica {
                 return Err(invalid("unsupported fixed membership"));
             }
             put(
-                &tx,
+                tx,
                 "membership",
                 &StoredMembershipOf::<Types>::new(Some(e.log_id), m),
             )?;
@@ -347,12 +404,12 @@ impl Replica {
         } else if src == &[0] {
             Reply::Protocol
         } else if let Some(raw) = src.strip_prefix(&[1]) {
-            self.apply_command(&tx, &k, raw, &digest)?
+            self.apply_command(tx, &k, raw, &digest)?
         } else {
             return Err(invalid("unknown raft source"));
         };
-        let (events, et) = tip(&tx, "event", &self.session)?;
-        let (receipts, rt) = tip(&tx, "receipt", &self.session)?;
+        let (events, et) = tip(tx, "event", &self.session)?;
+        let (receipts, rt) = tip(tx, "receipt", &self.session)?;
         tx.execute(
             "INSERT INTO archive VALUES(?,?,?,?,?,?,?,?)",
             params![
@@ -367,25 +424,59 @@ impl Replica {
             ],
         )
         .map_err(io::Error::other)?;
-        put(&tx, "applied", &e.log_id)?;
-        #[cfg(test)]
-        if src.first() == Some(&1) && self.crash.load(std::sync::atomic::Ordering::Acquire) == 1 {
-            std::process::exit(81)
-        }
-        tx.commit().map_err(io::Error::other)?;
-        #[cfg(test)]
-        if src.first() == Some(&1) && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2 {
-            std::process::exit(82)
-        }
+        put(tx, "applied", &e.log_id)?;
         Ok(reply)
     }
 }
-fn reduce(tx: &Transaction<'_>, c: &Command, m: &Material) -> io::Result<Applied> {
+pub(crate) fn historical_income(db: &Connection, actor: &[u8], seq: i64) -> io::Result<String> {
+    let read_event = |sql: &str| {
+        db.query_row(sql, params![actor, seq], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .optional()
+        .map_err(io::Error::other)
+    };
+    let previous = read_event(
+        "SELECT record,digest FROM event WHERE actor=?1 AND seq<=?2 ORDER BY seq DESC LIMIT 1",
+    )?;
+    let (record, digest, after) = if let Some((record, digest)) = previous {
+        (record, digest, true)
+    } else if let Some((record, digest)) = read_event(
+        "SELECT record,digest FROM event WHERE actor=?1 AND seq>?2 ORDER BY seq LIMIT 1",
+    )? {
+        (record, digest, false)
+    } else {
+        return db
+            .query_row(
+                "SELECT monthly FROM participant WHERE actor=?",
+                [actor],
+                |r| r.get(0),
+            )
+            .map_err(io::Error::other);
+    };
+    if Sha256::digest(&record).as_slice() != digest {
+        return Err(invalid("original event checksum mismatch"));
+    }
+    let f = fields(&record, &[1, 2, 3, 4, 5, 6, 7, 8])?;
+    let effects = Applied::decode(f[&7]).map_err(io::Error::other)?;
+    Ok(if after {
+        effects.total_income_after
+    } else {
+        effects.total_income_before
+    })
+}
+fn plan_redemption(tx: &Connection, c: &Command, m: &Material) -> io::Result<Applied> {
     let(cash,monthly,units):(String,String,String)=tx.query_row("SELECT cash,monthly,units FROM participant JOIN certificate USING(actor) WHERE actor=? AND position=?",
         params![c.actor,c.position],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(io::Error::other)?;
     if number(&units)? != m.units || number(&cash)? != m.cash {
         return Err(invalid("financial projection mismatch"));
     }
+    if historical_income(tx, &c.actor, i64::MAX)? != monthly {
+        return Err(invalid("recurring income projection mismatch"));
+    }
+    calculate_redemption(c, m, number(&monthly)?)
+}
+fn calculate_redemption(c: &Command, m: &Material, monthly_income: Integer) -> io::Result<Applied> {
     let owner = PlayerId::try_from(c.actor.as_slice()).map_err(|_| invalid("actor"))?;
     let pos = PositionId::try_from(c.position.as_slice()).map_err(|_| invalid("position"))?;
     let source = match m.principal {
@@ -395,8 +486,8 @@ fn reduce(tx: &Transaction<'_>, c: &Command, m: &Material) -> io::Result<Applied
     };
     let mut portfolio = Portfolio {
         owner: owner.clone(),
-        cash: number(&cash)?,
-        monthly_income: number(&monthly)?,
+        cash: m.cash.clone(),
+        monthly_income,
         certificates: [(
             pos.clone(),
             CertificateLot {
@@ -415,20 +506,6 @@ fn reduce(tx: &Transaction<'_>, c: &Command, m: &Material) -> io::Result<Applied
             },
         )
         .map_err(|_| invalid("invalid committed redemption"))?;
-    tx.execute(
-        "UPDATE participant SET cash=?,monthly=? WHERE actor=?",
-        params![
-            a.cash.after.to_string(),
-            a.player_monthly_income.after.to_string(),
-            c.actor
-        ],
-    )
-    .map_err(io::Error::other)?;
-    tx.execute(
-        "UPDATE certificate SET units=? WHERE actor=? AND position=?",
-        params![a.units.after.to_string(), c.actor, c.position],
-    )
-    .map_err(io::Error::other)?;
     Ok(Applied {
         position: c.position.clone(),
         principal_per_unit: m.principal,
@@ -444,6 +521,68 @@ fn reduce(tx: &Transaction<'_>, c: &Command, m: &Material) -> io::Result<Applied
         total_income_before: a.player_monthly_income.before.to_string(),
         total_income_after: a.player_monthly_income.after.to_string(),
     })
+}
+fn verify_linked_event(
+    db: &Connection,
+    original: &Command,
+    receipt: &std::collections::BTreeMap<u32, &[u8]>,
+    seq: i64,
+    expected_tip: &[u8],
+) -> io::Result<()> {
+    if fields(receipt[&7], &[13]).is_ok() {
+        if !receipt[&8].is_empty() {
+            return Err(invalid("conflict references a financial event"));
+        }
+        return Ok(());
+    }
+    let kind = fields(receipt[&7], &[11])?;
+    let leaf = fields(kind[&11], &[109])?;
+    let effects = Applied::decode(leaf[&109]).map_err(io::Error::other)?;
+    let id = hash(
+        b"event-id",
+        &[&original.session, receipt[&5], &seq.to_be_bytes()],
+    );
+    let expected = message(&[
+        (1, &original.session),
+        (2, receipt[&5]),
+        (3, &seq.to_be_bytes()),
+        (4, &id),
+        (5, receipt[&4]),
+        (6, &original.body()),
+        (7, leaf[&109]),
+        (8, receipt[&9]),
+    ]);
+    let prev = if seq == 1 {
+        hash(b"genesis", &[wire::PROFILE, &original.session, b"event"]).to_vec()
+    } else {
+        db.query_row(
+            "SELECT tip FROM event WHERE seq=?",
+            [seq.checked_sub(1).ok_or(invalid("event sequence"))?],
+            |r| r.get(0),
+        )
+        .map_err(io::Error::other)?
+    };
+    let tip = hash(
+        b"event-step",
+        &[
+            &prev,
+            &seq.to_be_bytes(),
+            receipt[&5],
+            &id,
+            receipt[&4],
+            receipt[&9],
+            &economic_transcript(&effects),
+        ],
+    );
+    let matches:bool=db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM event WHERE seq=? AND actor=? AND position=? AND cash_after=? AND units_after=?
+                        AND record=? AND digest=? AND tip=?)",
+        params![seq,original.actor,original.position,effects.cash_after,effects.units_after,expected,Sha256::digest(&expected).as_slice(),tip],
+        |r|r.get(0)).map_err(io::Error::other)?;
+    if !matches || receipt[&8] != id || tip != expected_tip {
+        return Err(invalid("receipt and financial event disagree"));
+    }
+    Ok(())
 }
 fn economic_transcript(a: &Applied) -> [u8; 32] {
     hash(
@@ -503,17 +642,7 @@ impl RaftStateMachine<Types> for Replica {
     async fn applied_state(&mut self) -> io::Result<(Option<LogId>, StoredMembershipOf<Types>)> {
         let db = self.lock()?;
         self.verify_checkpoint(&db)?;
-        let complete: bool = db
-            .query_row(
-                "SELECT (SELECT count(*)=coalesce(max(seq),0) FROM receipt) AND
-                    (SELECT count(*)=coalesce(max(seq),0) FROM event)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(io::Error::other)?;
-        if !complete {
-            return Err(invalid("incomplete history sequence"));
-        }
+        self.verify_replay(&db)?;
         Ok((
             meta(&db, "applied")?,
             meta(&db, "membership")?.unwrap_or_default(),

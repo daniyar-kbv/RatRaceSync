@@ -238,7 +238,9 @@ async fn quorum_commit_conflict_and_original_receipt() {
         })
         .await
         .unwrap();
+        use openraft::storage::RaftStateMachine;
         use sha2::{Digest, Sha256};
+        node.replica.clone().applied_state().await.unwrap();
         let db = node.replica.lock().unwrap();
         let (source, digest, tip): (Vec<u8>, Vec<u8>, Vec<u8>) = db
             .query_row(

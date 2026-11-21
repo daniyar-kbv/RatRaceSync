@@ -1,6 +1,7 @@
 //! Fixed-membership command application.
 mod application;
 mod node;
+mod recovery;
 mod store;
 mod types;
 mod wire;

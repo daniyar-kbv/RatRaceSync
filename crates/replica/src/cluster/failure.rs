@@ -166,3 +166,183 @@ async fn cloned_storage_cannot_start_a_second_raft_owner() {
     assert!(second.is_err());
     first.raft.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_verifies_interior_history_and_financial_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    for nonce in [1, 2] {
+        node.submit(command(node, nonce).await.sign(&key()))
+            .await
+            .unwrap();
+    }
+    let mut replica = node.replica.clone();
+    replica.applied_state().await.unwrap();
+    for damage in [
+        "DELETE FROM archive WHERE idx=(SELECT min(idx) FROM archive)",
+        "UPDATE archive SET source=x'00' WHERE receipt_count=1",
+        "UPDATE receipt SET record=x'01' WHERE seq=1",
+        "UPDATE event SET record=x'01' WHERE seq=1",
+        "UPDATE event SET units_after='8' WHERE seq=1",
+        "UPDATE participant SET monthly='999' WHERE actor=x'706c61796572'",
+        "DELETE FROM meta WHERE name='membership'",
+    ] {
+        replica
+            .lock()
+            .unwrap()
+            .execute_batch("SAVEPOINT damage")
+            .unwrap();
+        replica.lock().unwrap().execute_batch(damage).unwrap();
+        let result = replica.applied_state().await;
+        replica
+            .lock()
+            .unwrap()
+            .execute_batch("ROLLBACK TO damage; RELEASE damage")
+            .unwrap();
+        assert!(result.is_err(), "accepted {damage}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overflow_is_refused_before_submission_to_raft() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    let max = "9".repeat(128);
+    node.replica
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE participant SET opening_cash=?1,cash=?1 WHERE actor=?2",
+            rusqlite::params![max, ACTOR],
+        )
+        .unwrap();
+    let signed = command(node, 1).await.sign(&key());
+    assert!(node.replica.preflight(&signed).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_recovery_checks_its_original_event_before_replying() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    let signed = command(node, 1).await.sign(&key());
+    node.submit(signed.clone()).await.unwrap();
+    node.submit(command(node, 2).await.sign(&key()))
+        .await
+        .unwrap();
+    node.replica
+        .lock()
+        .unwrap()
+        .execute("UPDATE event SET record=x'00' WHERE seq=1", [])
+        .unwrap();
+    assert!(node.submit(signed).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_log_recovery_refuses_unprotected_purge() {
+    use openraft::storage::RaftLogStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    node.submit(command(node, 1).await.sign(&key()))
+        .await
+        .unwrap();
+    let mut store = node.replica.clone();
+    let k = store.applied_state().await.unwrap().0.unwrap();
+    assert!(store.purge(k).await.is_err());
+    store.applied_state().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_never_returns_reencoded_original_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    let signed = command(node, 1).await.sign(&key());
+    let Reply::Receipt(record) = node.submit(signed.clone()).await.unwrap() else {
+        panic!("missing receipt")
+    };
+    let f = wire::fields(&record, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+    let mut reordered = vec![];
+    for (tag, value) in f.iter().rev() {
+        wire::field(&mut reordered, *tag, value);
+    }
+    node.replica
+        .lock()
+        .unwrap()
+        .execute("UPDATE receipt SET record=? WHERE seq=1", [reordered])
+        .unwrap();
+    assert!(node.submit(signed).await.is_err());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_rejects_disagreement_with_prior_recurring_income() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    node.submit(command(node, 1).await.sign(&key()))
+        .await
+        .unwrap();
+    let signed = command(node, 2).await.sign(&key());
+    node.replica
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE participant SET monthly='400' WHERE actor=?",
+            [ACTOR],
+        )
+        .unwrap();
+    assert!(node.replica.preflight(&signed).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suffix_truncation_preserves_the_durable_commit_boundary() {
+    use openraft::storage::RaftLogStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    node.submit(command(node, 1).await.sign(&key()))
+        .await
+        .unwrap();
+    let mut store = node.replica.clone();
+    let committed = store.read_committed().await.unwrap().unwrap();
+    assert!(store.truncate_after(None).await.is_err());
+    let wrong = LogId::new(
+        openraft::impls::leader_id_adv::LeaderId {
+            term: committed.leader_id.term,
+            node_id: ReplicaId([255; 16]),
+        },
+        committed.index,
+    );
+    assert!(store.truncate_after(Some(wrong)).await.is_err());
+    store.truncate_after(Some(committed)).await.unwrap();
+    store.applied_state().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_guard_cannot_turn_an_original_overflow_into_a_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = Cluster::open(dir.path(), true).await;
+    let node = cluster.leader().await;
+    // Only one more principal credit fits in the numeric profile.
+    let cash = format!("{}4999", "9".repeat(124));
+    for peer in &cluster.nodes {
+        peer.replica
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE participant SET opening_cash=?1,cash=?1 WHERE actor=?2",
+                rusqlite::params![cash, ACTOR],
+            )
+            .unwrap();
+    }
+    let mut impossible = command(node, 2).await;
+    impossible.units = 2.into();
+    node.submit(command(node, 1).await.sign(&key()))
+        .await
+        .unwrap();
+    let reply = node.raft.client_write(impossible.sign(&key())).await;
+    assert!(reply.is_err());
+    assert_eq!(counts(node).2, 1);
+}

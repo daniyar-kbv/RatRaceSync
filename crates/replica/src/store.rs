@@ -127,23 +127,43 @@ impl RaftLogStorage<Types> for Replica {
         Ok(())
     }
     async fn truncate_after(&mut self, id: Option<LogId>) -> io::Result<()> {
-        self.lock()?
-            .execute(
-                "DELETE FROM raft_log WHERE ?1 IS NULL OR idx>?1",
-                [id.map(|v| v.index.to_be_bytes())],
-            )
-            .map_err(io::Error::other)?;
-        Ok(())
-    }
-    async fn purge(&mut self, id: LogId) -> io::Result<()> {
-        let mut db = self.lock()?;
-        let tx = db.transaction().map_err(io::Error::other)?;
-        tx.execute(
-            "DELETE FROM raft_log WHERE idx<=?",
-            [id.index.to_be_bytes()],
+        let db = self.lock()?;
+        for protected in [
+            meta::<LogId>(&db, "applied")?,
+            meta::<Option<LogId>>(&db, "committed")?.flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if id.is_none_or(|keep| {
+                keep.index < protected.index || (keep.index == protected.index && keep != protected)
+            }) {
+                return Err(invalid("truncation crosses a durable log boundary"));
+            }
+        }
+        if let Some(keep) = id {
+            let bytes: Vec<u8> = db
+                .query_row(
+                    "SELECT entry FROM raft_log WHERE idx=?",
+                    [keep.index.to_be_bytes()],
+                    |r| r.get(0),
+                )
+                .map_err(io::Error::other)?;
+            if decode::<Entry>(&bytes)?.log_id != keep {
+                return Err(invalid("truncation predecessor mismatch"));
+            }
+        }
+        db.execute(
+            "DELETE FROM raft_log WHERE ?1 IS NULL OR idx>?1",
+            [id.map(|v| v.index.to_be_bytes())],
         )
         .map_err(io::Error::other)?;
-        put(&tx, "purged", &id)?;
-        tx.commit().map_err(io::Error::other)
+        Ok(())
+    }
+    async fn purge(&mut self, _: LogId) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "log purge requires a verified snapshot and recoverable original history",
+        ))
     }
 }
