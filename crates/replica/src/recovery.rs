@@ -46,7 +46,7 @@ impl Replica {
             "SELECT * FROM receipt ORDER BY seq",
             "SELECT * FROM participant ORDER BY actor",
             "SELECT * FROM certificate ORDER BY actor,position",
-            "SELECT name,value FROM meta WHERE name IN ('applied','membership') ORDER BY name",
+            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log') ORDER BY name",
         ] {
             if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
                 return Err(invalid(
@@ -61,6 +61,9 @@ impl Replica {
 // The v1 schema persisted opening cash and units. For a player who has
 // redeemed, the first immutable applied event also records the prior income.
 fn seed_opening_state(source: &Connection, target: &Connection) -> io::Result<()> {
+    if let Some(creator) = store::meta::<crate::genesis::Creator>(source, "creator")? {
+        store::put(target, "creator", &creator)?;
+    }
     if let Some(open) = store::meta::<bool>(source, "finance_open")? {
         store::put(target, "finance_open", &open)?;
     }

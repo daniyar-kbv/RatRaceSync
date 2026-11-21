@@ -355,12 +355,24 @@ impl Replica {
         {
             std::process::exit(81)
         }
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&2)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 6
+        {
+            std::process::exit(96)
+        }
         tx.commit().map_err(io::Error::other)?;
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&1)
             && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
         {
             std::process::exit(82)
+        }
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&2)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 7
+        {
+            std::process::exit(97)
         }
         Ok(reply)
     }
@@ -387,13 +399,22 @@ impl Replica {
                 .map_err(io::Error::other)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(io::Error::other)?;
-            if meta::<StoredMembershipOf<Types>>(tx, "membership")?.is_some()
+            let valid_roster =
+                if let Some(creator) = meta::<crate::genesis::Creator>(tx, "creator")? {
+                    prev.is_none() && voters.is_empty() && m.voter_ids().eq([creator.node])
+                } else {
+                    (2..=10).contains(&voters.len())
+                        && voters.into_iter().map(ReplicaId).eq(m.voter_ids())
+                };
+            if !valid_roster
+                || meta::<StoredMembershipOf<Types>>(tx, "membership")?.is_some()
                 || m.get_joint_config().len() != 1
-                || !(2..=10).contains(&m.voter_ids().count())
                 || m.non_write_voter_ids().next().is_some()
-                || !voters.into_iter().map(ReplicaId).eq(m.voter_ids())
             {
                 return Err(invalid("unsupported fixed membership"));
+            }
+            if meta::<crate::genesis::Creator>(tx, "creator")?.is_some() {
+                put(tx, "genesis_log", &e.log_id)?;
             }
             put(
                 tx,

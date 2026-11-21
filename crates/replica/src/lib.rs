@@ -1,5 +1,8 @@
 //! Fixed-membership command application.
 mod application;
+mod catalog;
+mod genesis;
+pub use catalog::{CreatorGame, InstallationCatalog};
 mod node;
 mod recovery;
 mod store;
@@ -31,6 +34,14 @@ pub struct Replica {
 }
 impl Replica {
     pub fn open(path: &Path, session: &[u8]) -> io::Result<Self> {
+        Self::open_game(path, session, None, true)
+    }
+    fn open_game(
+        path: &Path,
+        session: &[u8],
+        creator: Option<&genesis::Creator>,
+        allow_create: bool,
+    ) -> io::Result<Self> {
         if session.is_empty() || session.len() > 64 {
             return Err(invalid("invalid session"));
         }
@@ -51,7 +62,11 @@ impl Replica {
             .truncate(false)
             .open(lock_name)?;
         writer.try_lock().map_err(io::Error::other)?;
-        let mut db = Connection::open(path).map_err(io::Error::other)?;
+        let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
+        if allow_create {
+            flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let mut db = Connection::open_with_flags(path, flags).map_err(io::Error::other)?;
         let mode: String = db
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .map_err(io::Error::other)?;
@@ -66,16 +81,27 @@ impl Replica {
         let version: i32 = tx
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(io::Error::other)?;
-        if version == 0 {
+        let expected_version = if creator.is_some() { 2 } else { 1 };
+        if version == 0 && allow_create {
             tx.execute_batch(include_str!("schema.sql"))
                 .map_err(io::Error::other)?;
             store::put(&tx, "session", &session)?;
-            tx.execute_batch("PRAGMA user_version=1")
+            if let Some(c) = creator {
+                store::put(&tx, "creator", &c)?;
+                store::put(&tx, "local_node", &c.node)?;
+            }
+            tx.pragma_update(None, "user_version", expected_version)
                 .map_err(io::Error::other)?;
-        } else if version != 1
+        } else if version != expected_version
+            || store::meta::<genesis::Creator>(&tx, "creator")?.as_ref() != creator
             || store::meta::<Vec<u8>>(&tx, "session")?.as_deref() != Some(session)
         {
             return Err(invalid("unexpected database identity or version"));
+        }
+        if let Some(c) = creator
+            && store::meta::<ReplicaId>(&tx, "local_node")? != Some(c.node)
+        {
+            return Err(invalid("original creator replica binding missing"));
         }
         tx.commit().map_err(io::Error::other)?;
         Ok(Self {

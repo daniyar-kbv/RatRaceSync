@@ -337,3 +337,4 @@ async fn real_process_loss_before_and_after_sql_commit() {
     }
 }
 mod failure;
+mod genesis;
