@@ -8,6 +8,7 @@ pub type Raft = openraft::Raft<Types, Replica>;
 pub struct GameNode {
     pub(crate) raft: Raft,
     pub(crate) replica: Replica,
+    pub(crate) sealer: Mutex<Option<learner::SealWorker>>,
 }
 #[derive(Debug)]
 pub enum SubmitError {
@@ -50,7 +51,11 @@ impl GameNode {
         let raft = Raft::new(id, config, network, replica.clone(), replica.clone())
             .await
             .map_err(io::Error::other)?;
-        Ok(Self { raft, replica })
+        Ok(Self {
+            raft,
+            replica,
+            sealer: Default::default(),
+        })
     }
     pub async fn submit(&self, signed: Signed) -> Result<Reply, SubmitError> {
         self.raft

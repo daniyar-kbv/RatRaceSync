@@ -452,6 +452,11 @@ impl Replica {
         let Some(Reply::Receipt(receipt)) = self.inspect_lobby(&db, signed)? else {
             return Err(invalid("missing original Create receipt"));
         };
+        LobbyCreation::from_receipt(receipt)
+    }
+}
+impl LobbyCreation {
+    pub(crate) fn from_receipt(receipt: Vec<u8>) -> io::Result<Self> {
         let outcome = fields(&receipt, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
         let leaf = fields(fields(outcome[&7], &[12])?[&12], &[201])?;
         let created = LobbyCreated::decode(leaf[&201]).map_err(io::Error::other)?;

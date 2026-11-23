@@ -14,14 +14,25 @@ pub(crate) struct Creator {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SignedGenesis {
-    body: Vec<u8>,
-    fingerprint: [u8; 32],
-    signature: Vec<u8>,
+pub(crate) struct SignedGenesis {
+    pub body: Vec<u8>,
+    pub fingerprint: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 fn fingerprint(body: &[u8], signature: &[u8]) -> [u8; 32] {
     wire::hash(b"RatRaceSync/genesis-root/v1", &[body, signature])
+}
+
+pub(crate) fn profile_manifest(reducer: &[u8]) -> Vec<u8> {
+    wire::message(&[
+        (1, b"protocol-1"),
+        (2, b"opaque-id-1"),
+        (3, b"Classic101-rules-1"),
+        (4, b"Classic101-content-1"),
+        (5, reducer),
+        (6, b"whole-usd-128-decimal-digits-1"),
+    ])
 }
 
 // A pending Create can legitimately have an empty log or only the initial
@@ -81,7 +92,7 @@ impl Replica {
     fn genesis_body(&self, db: &Connection, creator: &Creator) -> io::Result<Vec<u8>> {
         let k = store::meta::<LogId>(db, "genesis_log")?
             .ok_or(invalid("initial membership has not applied"))?;
-        verify_game_identity(db, &self.session, Some(creator))?;
+        verify_game_identity(db, &self.session, Some(creator), self.local_node)?;
         let committed = store::meta::<Option<LogId>>(db, "committed")?
             .flatten()
             .ok_or(invalid("missing commit boundary"))?;
@@ -123,14 +134,7 @@ impl Replica {
         }
         // A versioned profile manifest binds the Classic rules, content, reducer,
         // money and identity encodings without depending on platform metadata.
-        let profiles = wire::message(&[
-            (1, b"protocol-1"),
-            (2, b"opaque-id-1"),
-            (3, b"Classic101-rules-1"),
-            (4, b"Classic101-content-1"),
-            (5, self.profile()),
-            (6, b"whole-usd-128-decimal-digits-1"),
-        ]);
+        let profiles = profile_manifest(self.profile());
         Ok(wire::message(&[
             (1, b"RatRaceSync/genesis/v1"),
             (2, &self.session),
@@ -186,7 +190,7 @@ impl Replica {
 }
 
 impl SignedGenesis {
-    fn verify(&self, expected: &[u8], creator: &Creator) -> io::Result<()> {
+    pub(crate) fn verify(&self, expected: &[u8], creator: &Creator) -> io::Result<()> {
         if self.body != expected {
             return Err(invalid("signed genesis body mismatch"));
         }

@@ -2,6 +2,8 @@
 mod application;
 mod catalog;
 mod genesis;
+mod learner;
+pub use learner::{Learner, LearnerReplication};
 mod lobby;
 pub use catalog::{CreatorGame, InstallationCatalog};
 pub use lobby::{CreateLobby, LobbyCreated, LobbyCreation, LobbyStage};
@@ -66,14 +68,15 @@ fn verify_game_identity(
     db: &Connection,
     session: &[u8],
     creator: Option<&genesis::Creator>,
+    local_node: Option<ReplicaId>,
 ) -> io::Result<()> {
     if store::meta::<Vec<u8>>(db, "session")?.as_deref() != Some(session)
         || store::meta::<genesis::Creator>(db, "creator")?.as_ref() != creator
     {
         return Err(invalid("unexpected game database identity"));
     }
-    if let Some(creator) = creator
-        && store::meta::<ReplicaId>(db, "local_node")? != Some(creator.node)
+    if let Some(local) = local_node
+        && store::meta::<ReplicaId>(db, "local_node")? != Some(local)
     {
         return Err(invalid("original creator replica binding missing"));
     }
@@ -86,19 +89,51 @@ pub struct Replica {
     _writer: Arc<std::fs::File>,
     started: Arc<std::sync::atomic::AtomicBool>,
     session: Vec<u8>,
+    local_node: Option<ReplicaId>,
     lobby_format: Option<lobby::LobbyFormat>,
     bound_root: Arc<std::sync::OnceLock<[u8; 32]>>,
+    seal_wake: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
     #[cfg(test)]
     crash: Arc<std::sync::atomic::AtomicU8>,
 }
 impl Replica {
     pub fn open(path: &Path, session: &[u8]) -> io::Result<Self> {
-        Self::open_game(path, session, None, true, None)
+        Self::open_generation(path, session, None, None, true, None)
     }
-    fn open_game(
+    async fn open_reserved_generation(
+        path: &Path,
+        session: &[u8],
+        creator: &genesis::Creator,
+        local: ReplicaId,
+        allow_create: bool,
+        lobby_format: Option<lobby::LobbyFormat>,
+    ) -> io::Result<Self> {
+        use openraft::AsyncRuntime;
+        use std::time::{Duration, Instant};
+        // Raft storage workers can outlive core shutdown briefly. Always
+        // acquire the kernel lock, including on a catalog-owned clean restart.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match Self::open_generation(
+                path,
+                session,
+                Some(creator),
+                Some(local),
+                allow_create,
+                lobby_format,
+            ) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    openraft::alias::AsyncRuntimeOf::<Types>::sleep(Duration::from_millis(10)).await
+                }
+                result => return result,
+            }
+        }
+    }
+    fn open_generation(
         path: &Path,
         session: &[u8],
         creator: Option<&genesis::Creator>,
+        local_node: Option<ReplicaId>,
         allow_create: bool,
         lobby_format: Option<lobby::LobbyFormat>,
     ) -> io::Result<Self> {
@@ -121,7 +156,7 @@ impl Replica {
             .create(true)
             .truncate(false)
             .open(lock_name)?;
-        writer.try_lock().map_err(io::Error::other)?;
+        writer.try_lock().map_err(io::Error::from)?;
         check_sqlite_files(&path)?;
         let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
         if allow_create {
@@ -154,20 +189,26 @@ impl Replica {
             store::put(&tx, "session", &session)?;
             if let Some(c) = creator {
                 store::put(&tx, "creator", &c)?;
-                store::put(&tx, "local_node", &c.node)?;
+                store::put(
+                    &tx,
+                    "local_node",
+                    &local_node.ok_or(invalid("missing replica identity"))?,
+                )?;
             }
             tx.pragma_update(None, "user_version", expected_version)
                 .map_err(io::Error::other)?;
         }
-        verify_game_identity(&tx, session, creator)?;
+        verify_game_identity(&tx, session, creator, local_node)?;
         tx.commit().map_err(io::Error::other)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             _writer: Arc::new(writer),
             started: Default::default(),
             session: session.into(),
+            local_node,
             lobby_format,
             bound_root: Default::default(),
+            seal_wake: Default::default(),
             #[cfg(test)]
             crash: Default::default(),
         })

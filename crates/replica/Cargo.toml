@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
 ed25519-dalek = "2"
+getrandom = "0.4"
 prost = "0.14"
 futures = "0.3"
 

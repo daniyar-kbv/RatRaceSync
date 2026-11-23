@@ -11,7 +11,10 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use tokio::time::{sleep, timeout};
 
 #[derive(Clone, Default)]
-struct Bus(Arc<Mutex<BTreeMap<ReplicaId, Raft>>>);
+struct Bus(
+    Arc<Mutex<BTreeMap<ReplicaId, Raft>>>,
+    Arc<Mutex<BTreeMap<ReplicaId, (ReplicaId, LearnerReplication)>>>,
+);
 struct Peer {
     bus: Bus,
     id: ReplicaId,
@@ -43,6 +46,13 @@ impl RaftNetworkV2<Types> for Peer {
         r: AppendEntriesRequest<Types>,
         _: RPCOption,
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
+        let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
+        if let Some((sender, peer)) = learner {
+            return peer
+                .append_entries(sender, r)
+                .await
+                .map_err(|e| Unreachable::new(&e).into());
+        }
         self.raft()?
             .append_entries(r)
             .await

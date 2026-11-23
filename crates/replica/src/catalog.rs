@@ -19,8 +19,8 @@ pub struct CreatorGame {
 }
 
 pub struct InstallationCatalog {
-    directory: PathBuf,
-    db: Connection,
+    pub(crate) directory: PathBuf,
+    pub(crate) db: Connection,
     _writer: fs::File,
     running: Weak<GameNode>,
     #[cfg(test)]
@@ -36,7 +36,7 @@ struct Reservation {
     lobby_command: Option<Signed>,
 }
 
-fn ensure_empty_inventory(directory: &Path) -> io::Result<()> {
+pub(crate) fn ensure_empty_inventory(directory: &Path) -> io::Result<()> {
     for file in fs::read_dir(directory)? {
         if !matches!(
             file?.file_name().to_str(),
@@ -83,8 +83,11 @@ impl InstallationCatalog {
                 db.prepare("SELECT request,session,actor,public_key,node,stage,pin FROM participation WHERE slot=1")
                     .map_err(io::Error::other)?;
             }
-            2 => {
+            2 | 3 => {
                 Self::reservation(&db)?;
+                if version == 3 {
+                    crate::learner::check_inventory(&db)?;
+                }
             }
             _ => return Err(invalid("unsupported installation catalog")),
         }
@@ -161,6 +164,9 @@ impl InstallationCatalog {
     }
     /// Local catalog state. Opening an active game verifies its independent pin again.
     pub fn active_pin(&self) -> io::Result<Option<[u8; 32]>> {
+        if database_version(&self.db)? == 3 {
+            return self.verified_learner_pin();
+        }
         Ok(Self::reservation(&self.db)?.and_then(|r| r.pin))
     }
     fn game_path(&self, r: &Reservation) -> PathBuf {
@@ -174,6 +180,9 @@ impl InstallationCatalog {
         key: &SigningKey,
         lobby: Option<CreateLobby<'_>>,
     ) -> io::Result<Reservation> {
+        if database_version(&self.db)? == 3 {
+            return Err(invalid("learner owns the participation slot"));
+        }
         if actor.is_empty() || actor.len() > 64 || request[6] >> 4 != 4 || request[8] >> 6 != 2 {
             return Err(invalid("invalid creator or Create request ID"));
         }
@@ -334,6 +343,11 @@ impl InstallationCatalog {
             if r.lobby_command.is_some() {
                 confirm_creator_read(&node).await?;
             }
+            if format == Some(LobbyFormat::SemanticLinks)
+                && let Some(key) = key
+            {
+                node.enable_sealer(key)?;
+            }
             return Ok(CreatorGame {
                 lobby: r
                     .lobby_command
@@ -350,7 +364,15 @@ impl InstallationCatalog {
         if path.is_symlink() {
             return Err(invalid("invalid game generation path"));
         }
-        let replica = Replica::open_game(&path, &r.session, Some(&r.creator), !r.prepared, format)?;
+        let replica = Replica::open_reserved_generation(
+            &path,
+            &r.session,
+            &r.creator,
+            r.creator.node,
+            !r.prepared,
+            format,
+        )
+        .await?;
         // A pending reservation may already own a signed record. Verify it
         // before Raft can campaign or append on a recovered generation.
         let original = replica.root(&r.creator, None)?;
@@ -415,6 +437,13 @@ impl InstallationCatalog {
             }
         };
         let node = Arc::new(node);
+        if format == Some(LobbyFormat::SemanticLinks)
+            && let Some(key) = key
+            && let Err(error) = node.enable_sealer(key)
+        {
+            let _ = node.raft.shutdown().await;
+            return Err(error);
+        }
         self.running = Arc::downgrade(&node);
         Ok(CreatorGame {
             lobby,

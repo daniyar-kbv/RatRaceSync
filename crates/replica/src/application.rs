@@ -358,6 +358,7 @@ impl Replica {
             std::process::exit(96)
         }
         tx.commit().map_err(io::Error::other)?;
+        self.notify_sealer();
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&1)
             && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
@@ -395,21 +396,33 @@ impl Replica {
                 .map_err(io::Error::other)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(io::Error::other)?;
+            let previous = meta::<StoredMembershipOf<Types>>(tx, "membership")?;
             let valid_roster =
                 if let Some(creator) = meta::<crate::genesis::Creator>(tx, "creator")? {
-                    prev.is_none() && voters.is_empty() && m.voter_ids().eq([creator.node])
+                    let valid_learners = if let Some(previous) = &previous {
+                        self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
+                            && meta::<Vec<u8>>(tx, "lobby")?.is_some()
+                            && m.non_write_voter_ids().count() == 1
+                            && previous
+                                .membership()
+                                .non_write_voter_ids()
+                                .all(|id| m.non_write_voter_ids().any(|n| n == id))
+                    } else {
+                        prev.is_none()
+                    };
+                    valid_learners && voters.is_empty() && m.voter_ids().eq([creator.node])
                 } else {
-                    (2..=10).contains(&voters.len())
+                    previous.is_none()
+                        && (2..=10).contains(&voters.len())
                         && voters.into_iter().map(ReplicaId).eq(m.voter_ids())
                 };
             if !valid_roster
-                || meta::<StoredMembershipOf<Types>>(tx, "membership")?.is_some()
                 || m.get_joint_config().len() != 1
-                || m.non_write_voter_ids().next().is_some()
+                || (previous.is_none() && m.non_write_voter_ids().next().is_some())
             {
                 return Err(invalid("unsupported fixed membership"));
             }
-            if meta::<crate::genesis::Creator>(tx, "creator")?.is_some() {
+            if previous.is_none() && meta::<crate::genesis::Creator>(tx, "creator")?.is_some() {
                 put(tx, "genesis_log", &e.log_id)?;
             }
             put(

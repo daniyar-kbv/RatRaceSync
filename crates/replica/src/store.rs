@@ -103,7 +103,9 @@ impl RaftLogStorage<Types> for Replica {
         put(&*self.lock()?, "vote", v)
     }
     async fn save_committed(&mut self, v: Option<LogId>) -> io::Result<()> {
-        put(&*self.lock()?, "committed", &v)
+        put(&*self.lock()?, "committed", &v)?;
+        self.notify_sealer();
+        Ok(())
     }
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
         Ok(meta::<Option<LogId>>(&*self.lock()?, "committed")?.flatten())

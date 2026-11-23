@@ -2,6 +2,7 @@ use super::*;
 use ed25519_dalek::Signer;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
+mod learner;
 mod review;
 
 const REQUEST: [u8; 16] = [2, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1];
