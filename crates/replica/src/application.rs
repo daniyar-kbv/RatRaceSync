@@ -223,7 +223,7 @@ impl Replica {
     pub(crate) fn preflight(&self, signed: &Signed) -> io::Result<Option<Reply>> {
         let db = self.lock()?;
         self.verify_checkpoint(&db)?;
-        if self.lobby_enabled {
+        if self.lobby_format.is_some() {
             return self.inspect_lobby(&db, signed);
         }
         let (c, reply) = self.inspect(&db, &signed.0)?;
@@ -340,7 +340,8 @@ impl Replica {
         // A duplicate can already be committed when a retry bypasses preflight.
         // Check the pre-entry state inside this transaction before acknowledging
         // any stored Create outcome. Scratch replay calls apply_in_transaction.
-        if self.lobby_enabled && e.payload.bytes.first() == Some(&1) {
+        if self.lobby_format.is_some() && e.payload.bytes.first() == Some(&1) {
+            self.require_lobby_genesis(&tx)?;
             self.verify_replay(&tx)?;
         }
         let reply = self.apply_in_transaction(&tx, &e)?;
@@ -420,7 +421,7 @@ impl Replica {
         } else if src == &[0] {
             Reply::Protocol
         } else if let Some(raw) = src.strip_prefix(&[1]) {
-            if self.lobby_enabled {
+            if self.lobby_format.is_some() {
                 self.apply_lobby(tx, &k, raw, &digest)?
             } else {
                 self.apply_command(tx, &k, raw, &digest)?
@@ -651,9 +652,9 @@ pub(crate) struct ReceiptRecord<'a> {
     pub source_digest: &'a [u8],
 }
 impl ReceiptRecord<'_> {
-    pub fn encode(&self, previous_tip: &[u8], outcome_digest: &[u8]) -> (Vec<u8>, [u8; 32]) {
+    pub fn record(&self) -> Vec<u8> {
         let seq = self.seq.to_be_bytes();
-        let record = message(&[
+        message(&[
             (1, self.session),
             (2, self.actor),
             (3, self.request),
@@ -663,7 +664,10 @@ impl ReceiptRecord<'_> {
             (7, self.outcome),
             (8, self.refs),
             (9, self.source_digest),
-        ]);
+        ])
+    }
+    pub fn encode(&self, previous_tip: &[u8], outcome_digest: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        let seq = self.seq.to_be_bytes();
         let tip = hash(
             b"receipt-step",
             &[
@@ -679,7 +683,7 @@ impl ReceiptRecord<'_> {
                 outcome_digest,
             ],
         );
-        (record, tip)
+        (self.record(), tip)
     }
 }
 impl Replica {

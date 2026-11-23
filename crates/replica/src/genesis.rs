@@ -64,6 +64,20 @@ fn verify_raft_lineage(db: &Connection) -> io::Result<()> {
 }
 
 impl Replica {
+    pub(crate) fn require_lobby_genesis(&self, db: &Connection) -> io::Result<()> {
+        verify_raft_lineage(db)?;
+        let creator =
+            store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing lobby creator"))?;
+        let proof = store::meta::<SignedGenesis>(db, "signed_genesis")?
+            .ok_or(invalid("original genesis certificate missing"))?;
+        let expected = self.genesis_body(db, &creator)?;
+        proof.verify(&expected, &creator)?;
+        if self.bound_root.get() != Some(&proof.fingerprint) {
+            return Err(invalid("lobby root differs from verified game generation"));
+        }
+        Ok(())
+    }
+
     fn genesis_body(&self, db: &Connection, creator: &Creator) -> io::Result<Vec<u8>> {
         let k = store::meta::<LogId>(db, "genesis_log")?
             .ok_or(invalid("initial membership has not applied"))?;
@@ -141,6 +155,9 @@ impl Replica {
         let tx = db.transaction().map_err(io::Error::other)?;
         verify_raft_lineage(&tx)?;
         let original = store::meta::<SignedGenesis>(&tx, "signed_genesis")?;
+        if original.is_none() && self.bound_root.get().is_some() {
+            return Err(invalid("previously verified genesis certificate missing"));
+        }
         if original.is_none() && sign_if_absent.is_none() {
             return Ok(None);
         }
@@ -159,20 +176,30 @@ impl Replica {
                 proof
             }
         };
-        if proof.body != expected {
+        proof.verify(&expected, creator)?;
+        tx.commit().map_err(io::Error::other)?;
+        if self.bound_root.get_or_init(|| proof.fingerprint) != &proof.fingerprint {
+            return Err(invalid("game generation root changed"));
+        }
+        Ok(Some(proof.fingerprint))
+    }
+}
+
+impl SignedGenesis {
+    fn verify(&self, expected: &[u8], creator: &Creator) -> io::Result<()> {
+        if self.body != expected {
             return Err(invalid("signed genesis body mismatch"));
         }
         VerifyingKey::from_bytes(&creator.key)
             .map_err(io::Error::other)?
             .verify_strict(
-                &proof.body,
-                &Signature::from_slice(&proof.signature).map_err(io::Error::other)?,
+                &self.body,
+                &Signature::from_slice(&self.signature).map_err(io::Error::other)?,
             )
             .map_err(io::Error::other)?;
-        if fingerprint(&proof.body, &proof.signature) != proof.fingerprint {
+        if fingerprint(&self.body, &self.signature) != self.fingerprint {
             return Err(invalid("stored genesis fingerprint mismatch"));
         }
-        tx.commit().map_err(io::Error::other)?;
-        Ok(Some(proof.fingerprint))
+        Ok(())
     }
 }

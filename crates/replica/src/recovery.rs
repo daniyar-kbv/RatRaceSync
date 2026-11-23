@@ -14,9 +14,15 @@ impl Replica {
         // An unnamed SQLite file is temporary, can spill to disk, and is deleted
         // on close. No verification write touches the game database.
         let mut scratch = Connection::open("").map_err(io::Error::other)?;
-        store::create_schema(&scratch, self.lobby_enabled)?;
+        store::create_schema(&scratch, self.lobby_format)?;
         let replay = scratch.transaction().map_err(io::Error::other)?;
-        seed_opening_state(db, &replay)?;
+        if self.lobby_format.is_some() {
+            let creator = store::meta::<crate::genesis::Creator>(db, "creator")?
+                .ok_or(invalid("missing lobby creator"))?;
+            store::put(&replay, "creator", &creator)?;
+        } else {
+            seed_opening_state(db, &replay)?;
+        }
         if let Some(k) = last {
             let mut statement = db
                 .prepare("SELECT idx,entry FROM raft_log WHERE idx<=? ORDER BY idx")
@@ -44,13 +50,23 @@ impl Replica {
             "SELECT * FROM receipt ORDER BY seq",
             "SELECT * FROM participant ORDER BY actor",
             "SELECT * FROM certificate ORDER BY actor,position",
-            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby') ORDER BY name",
+            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby','finance_open') ORDER BY name",
         ] {
             if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
                 return Err(invalid(
                     "persisted history or state differs from committed replay",
                 ));
             }
+        }
+        if self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
+            && !same_rows(
+                db,
+                &replay,
+                "SELECT * FROM semantic_link ORDER BY ledger,seq",
+            )
+            .map_err(io::Error::other)?
+        {
+            return Err(invalid("semantic records differ from committed replay"));
         }
         Ok(())
     }

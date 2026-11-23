@@ -86,20 +86,21 @@ pub struct Replica {
     _writer: Arc<std::fs::File>,
     started: Arc<std::sync::atomic::AtomicBool>,
     session: Vec<u8>,
-    lobby_enabled: bool,
+    lobby_format: Option<lobby::LobbyFormat>,
+    bound_root: Arc<std::sync::OnceLock<[u8; 32]>>,
     #[cfg(test)]
     crash: Arc<std::sync::atomic::AtomicU8>,
 }
 impl Replica {
     pub fn open(path: &Path, session: &[u8]) -> io::Result<Self> {
-        Self::open_game(path, session, None, true, false)
+        Self::open_game(path, session, None, true, None)
     }
     fn open_game(
         path: &Path,
         session: &[u8],
         creator: Option<&genesis::Creator>,
         allow_create: bool,
-        lobby_enabled: bool,
+        lobby_format: Option<lobby::LobbyFormat>,
     ) -> io::Result<Self> {
         if session.is_empty() || session.len() > 64 {
             return Err(invalid("invalid session"));
@@ -128,12 +129,11 @@ impl Replica {
         }
         let mut db = Connection::open_with_flags(path, flags).map_err(io::Error::other)?;
         let version = database_version(&db)?;
-        let expected_version = if lobby_enabled {
-            3
-        } else if creator.is_some() {
-            2
-        } else {
-            1
+        let expected_version = match lobby_format {
+            Some(lobby::LobbyFormat::SemanticLinks) => 4,
+            Some(lobby::LobbyFormat::Legacy) => 3,
+            None if creator.is_some() => 2,
+            None => 1,
         };
         if version != expected_version && !(version == 0 && allow_create) {
             return Err(invalid("unexpected game database version"));
@@ -150,7 +150,7 @@ impl Replica {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(io::Error::other)?;
         if version == 0 {
-            store::create_schema(&tx, lobby_enabled)?;
+            store::create_schema(&tx, lobby_format)?;
             store::put(&tx, "session", &session)?;
             if let Some(c) = creator {
                 store::put(&tx, "creator", &c)?;
@@ -166,7 +166,8 @@ impl Replica {
             _writer: Arc::new(writer),
             started: Default::default(),
             session: session.into(),
-            lobby_enabled,
+            lobby_format,
+            bound_root: Default::default(),
             #[cfg(test)]
             crash: Default::default(),
         })
@@ -177,10 +178,7 @@ impl Replica {
             .map_err(|_| io::Error::other("database lock poisoned"))
     }
     fn profile(&self) -> &'static [u8] {
-        if self.lobby_enabled {
-            lobby::PROFILE
-        } else {
-            wire::PROFILE
-        }
+        self.lobby_format
+            .map_or(wire::PROFILE, lobby::LobbyFormat::profile)
     }
 }

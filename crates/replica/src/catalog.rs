@@ -1,5 +1,5 @@
 //! Installation-local Create reservation and independent trust-root pin.
-use crate::lobby::LobbyCommand;
+use crate::lobby::{LobbyCommand, LobbyFormat};
 use crate::{genesis::Creator, *};
 use ed25519_dalek::SigningKey;
 use openraft::{
@@ -197,6 +197,7 @@ impl InstallationCatalog {
             let mut r = Self::reservation(&tx)?.ok_or(invalid("missing reservation"))?;
             if let Some(capacity) = capacity {
                 let signed = LobbyCommand {
+                    format: LobbyFormat::SemanticLinks,
                     session: &r.session,
                     actor,
                     request,
@@ -270,6 +271,27 @@ impl InstallationCatalog {
         self.resume(r, Some(key), config, network).await
     }
 
+    /// Reconcile an already-authorized Create after process restart using its
+    /// durable signed intent and the installation's existing creator identity.
+    pub async fn resume_lobby_create<N>(
+        &mut self,
+        key: &SigningKey,
+        config: Config,
+        network: N,
+    ) -> io::Result<CreatorGame>
+    where
+        N: RaftNetworkFactory<Types>,
+        N::Network: NetSnapshot<Types, SnapshotData = ()>,
+    {
+        let r = Self::reservation(&self.db)?
+            .filter(|r| r.lobby_command.is_some())
+            .ok_or(invalid("no reserved lobby Create"))?;
+        if r.creator.key != key.verifying_key().to_bytes() {
+            return Err(invalid("Create belongs to another signing identity"));
+        }
+        self.resume(r, Some(key), config, network).await
+    }
+
     /// Reopen the pinned generation without the creator's private key.
     pub async fn open_active<N>(&mut self, config: Config, network: N) -> io::Result<CreatorGame>
     where
@@ -293,10 +315,15 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
+        let format = r
+            .lobby_command
+            .as_ref()
+            .map(|s| LobbyCommand::verify(&s.0, &r.session, &r.creator).map(|c| c.format))
+            .transpose()?;
         if let Some(node) = self.running.upgrade() {
             let pin = r.pin.ok_or(invalid("live game requires an active pin"))?;
             if node.replica.session != r.session
-                || node.replica.lobby_enabled != r.lobby_command.is_some()
+                || node.replica.lobby_format != format
                 || node.replica.root(&r.creator, None)? != Some(pin)
             {
                 return Err(invalid("active catalog pin mismatch"));
@@ -323,16 +350,15 @@ impl InstallationCatalog {
         if path.is_symlink() {
             return Err(invalid("invalid game generation path"));
         }
-        let replica = Replica::open_game(
-            &path,
-            &r.session,
-            Some(&r.creator),
-            !r.prepared,
-            r.lobby_command.is_some(),
-        )?;
+        let replica = Replica::open_game(&path, &r.session, Some(&r.creator), !r.prepared, format)?;
         // A pending reservation may already own a signed record. Verify it
         // before Raft can campaign or append on a recovered generation.
         let original = replica.root(&r.creator, None)?;
+        if r.pin.is_none()
+            && let Some(signed) = &r.lobby_command
+        {
+            replica.verify_pending_create(signed, original.is_some())?;
+        }
         if r.pin.is_some() && original != r.pin {
             return Err(invalid("game genesis does not match catalog pin"));
         }

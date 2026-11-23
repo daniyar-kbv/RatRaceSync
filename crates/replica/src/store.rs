@@ -168,8 +168,17 @@ impl RaftLogStorage<Types> for Replica {
     }
 }
 /// Used for both a pristine generation and its independent replay database.
-pub(crate) fn create_schema(db: &Connection, lobby_enabled: bool) -> io::Result<()> {
-    let event_table = if lobby_enabled {
+pub(crate) fn create_schema(
+    db: &Connection,
+    lobby_format: Option<lobby::LobbyFormat>,
+) -> io::Result<()> {
+    if lobby_format == Some(lobby::LobbyFormat::SemanticLinks) {
+        db.execute_batch("CREATE TABLE semantic_link (
+            ledger TEXT NOT NULL CHECK(ledger IN ('event','receipt')), seq INTEGER NOT NULL CHECK(seq>0),
+            previous_tip BLOB NOT NULL CHECK(length(previous_tip)=32), record BLOB NOT NULL,
+            PRIMARY KEY(ledger,seq)) STRICT").map_err(io::Error::other)?;
+    }
+    let event_table = if lobby_format.is_some() {
         "CREATE TABLE event (seq INTEGER PRIMARY KEY, actor BLOB NOT NULL, position BLOB,
          cash_after TEXT, units_after TEXT, record BLOB NOT NULL, digest BLOB NOT NULL, tip BLOB NOT NULL,
          CHECK ((position IS NULL) = (cash_after IS NULL) AND (position IS NULL) = (units_after IS NULL))) STRICT"

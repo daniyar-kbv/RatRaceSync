@@ -2,6 +2,7 @@ use super::*;
 use ed25519_dalek::Signer;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
+mod review;
 
 const REQUEST: [u8; 16] = [2, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1];
 
@@ -150,13 +151,7 @@ async fn interrupted_lobby_worker() {
 async fn retries_finish_the_reserved_signed_command_across_both_databases() {
     for (stage, exit) in [(1, 91), (8, 98), (4, 94), (9, 81), (10, 82), (5, 95)] {
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "cluster::lobby::interrupted_lobby_worker"])
-            .env("LOBBY_TEST_DIRECTORY", dir.path())
-            .env("LOBBY_TEST_STAGE", stage.to_string())
-            .status()
-            .unwrap();
-        assert_eq!(status.code(), Some(exit));
+        review::interrupt(dir.path(), stage, exit);
         let inventory = Connection::open(dir.path().join("installation.sqlite")).unwrap();
         let (session, node, signed, pin): (Vec<u8>, [u8; 16], Vec<u8>, Option<Vec<u8>>) = inventory
             .query_row(
