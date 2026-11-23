@@ -30,6 +30,10 @@ impl Replica {
         self.verify_replay(&tx)?;
         let last = first.saturating_add(15).min(high.index);
         for index in first..=last {
+            if history::joined_at(&tx, index)?.is_some() {
+                tx.commit().map_err(io::Error::other)?;
+                return Ok(false);
+            }
             history::seal(self, &tx, index, key)?;
         }
         tx.commit().map_err(io::Error::other)?;

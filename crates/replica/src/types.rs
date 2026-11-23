@@ -54,15 +54,21 @@ impl RaftPayload for Source {
         }
     }
     fn with_normal(self, cmd: Signed) -> Self {
+        let members = self.members;
         let mut bytes = vec![1];
         bytes.extend(cmd.0);
-        Self {
+        let source = Self {
             bytes,
             members: None,
+        };
+        if let Some(m) = members {
+            source.with_membership(m)
+        } else {
+            source
         }
     }
     fn with_membership(self, m: Members) -> Self {
-        let mut bytes = vec![2];
+        let mut bytes = vec![if self.bytes.first() == Some(&1) { 3 } else { 2 }];
         bytes.extend(store::encode(&m).expect("integer membership is serializable"));
         bytes.extend(self.bytes);
         Self {
@@ -75,7 +81,26 @@ impl RaftPayload for Source {
     }
 }
 impl Source {
+    pub(crate) fn join_command(&self) -> io::Result<Option<&[u8]>> {
+        if self.bytes.first() != Some(&3) {
+            return Ok(None);
+        }
+        let m = self
+            .members
+            .as_ref()
+            .ok_or(super::invalid("missing combined membership"))?;
+        let prefix = store::encode(m)?;
+        let raw = self.bytes[1..]
+            .strip_prefix(prefix.as_slice())
+            .and_then(|v| v.strip_prefix(&[1]))
+            .filter(|v| !v.is_empty())
+            .ok_or(super::invalid("invalid combined source"))?;
+        Ok(Some(raw))
+    }
     pub(crate) fn check_members(&self) -> io::Result<Option<Members>> {
+        if self.join_command()?.is_some() {
+            return Ok(self.members.clone());
+        }
         if let Some(m) = self.members.as_ref() {
             let expected = Self::blank().with_membership(m.clone());
             if expected.bytes != self.bytes {

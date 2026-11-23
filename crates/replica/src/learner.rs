@@ -1,4 +1,4 @@
-//! Recovery for a creator-only lobby over an authenticated peer transport.
+//! Verified recovery and first-player admission over an authenticated peer transport.
 use crate::{
     genesis::{Creator, SignedGenesis},
     wire::{fields, message},
@@ -9,6 +9,10 @@ use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 mod history;
+mod join;
+mod quorum;
+pub use join::{JoinDelivery, JoinResult, JoinedMember};
+pub use quorum::VotingHistoryRequest;
 mod installation;
 mod sealing;
 pub(crate) use installation::check_inventory;
@@ -106,10 +110,46 @@ pub struct Learner {
 #[derive(Clone)]
 pub struct LearnerReplication {
     raft: Raft,
+    replica: Replica,
     creator: ReplicaId,
     local: ReplicaId,
 }
 impl LearnerReplication {
+    pub async fn vote(
+        &self,
+        sender: ReplicaId,
+        request: openraft::raft::VoteRequest<Types>,
+        pre_vote: bool,
+    ) -> io::Result<openraft::raft::VoteResponse<Types>> {
+        self.vote_with_join_source(sender, request, pre_vote, None)
+            .await
+    }
+    /// When the candidate crashed after appending Join but before replication,
+    /// its durable effective configuration can be ahead of this receiver.
+    pub async fn vote_with_join_source(
+        &self,
+        sender: ReplicaId,
+        request: openraft::raft::VoteRequest<Types>,
+        pre_vote: bool,
+        source: Option<&[u8]>,
+    ) -> io::Result<openraft::raft::VoteResponse<Types>> {
+        if sender != self.creator || request.vote.leader_id.node_id != sender {
+            return Err(invalid("vote outside authorized two-voter configuration"));
+        }
+        if !self.raft.voter_ids().any(|id| id == self.local) {
+            self.replica.verify_candidate_join(
+                &request,
+                pre_vote,
+                source.ok_or(invalid("missing candidate's effective Join entry"))?,
+            )?;
+        }
+        if pre_vote {
+            self.raft.pre_vote(request).await
+        } else {
+            self.raft.vote(request).await
+        }
+        .map_err(io::Error::other)
+    }
     pub async fn append_entries(
         &self,
         authenticated_sender: ReplicaId,
@@ -119,7 +159,16 @@ impl LearnerReplication {
             return Err(invalid("replication sender differs from pinned creator"));
         }
         for entry in &request.entries {
+            if let Some(raw) = entry.payload.join_command()? {
+                self.replica.verify_local_promotion(raw, &entry.payload)?;
+                continue;
+            }
             if let Some(m) = entry.payload.check_members()? {
+                if store::meta::<JoinedMember>(&*self.replica.lock()?, "first_member")?
+                    .is_some_and(|member| entry.log_id.index >= member.log_id.index)
+                {
+                    return Err(invalid("unrequested change to joined voting membership"));
+                }
                 let valid_targets = if entry.log_id.index == 0 {
                     m.non_write_voter_ids().next().is_none()
                 } else {
@@ -165,6 +214,7 @@ impl Learner {
     pub fn replication(&self) -> LearnerReplication {
         LearnerReplication {
             raft: self.node.raft.clone(),
+            replica: self.node.replica.clone(),
             creator: self.creator.node,
             local: self.id,
         }

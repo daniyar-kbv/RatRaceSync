@@ -340,11 +340,20 @@ impl Replica {
         // A duplicate can already be committed when a retry bypasses preflight.
         // Check the pre-entry state inside this transaction before acknowledging
         // any stored Create outcome. Scratch replay calls apply_in_transaction.
-        if self.lobby_format.is_some() && e.payload.bytes.first() == Some(&1) {
+        if self.lobby_format.is_some() && matches!(e.payload.bytes.first(), Some(1 | 3)) {
             self.require_lobby_genesis(&tx)?;
             self.verify_replay(&tx)?;
+            if let Some(raw) = e.payload.join_command()? {
+                self.verify_join_coverage(&tx, raw)?;
+            }
         }
         let reply = self.apply_in_transaction(&tx, &e)?;
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&3)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
+        {
+            std::process::exit(112);
+        }
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&1)
             && self.crash.load(std::sync::atomic::Ordering::Acquire) == 1
@@ -359,6 +368,12 @@ impl Replica {
         }
         tx.commit().map_err(io::Error::other)?;
         self.notify_sealer();
+        #[cfg(test)]
+        if e.payload.bytes.first() == Some(&3)
+            && self.crash.load(std::sync::atomic::Ordering::Acquire) == 3
+        {
+            std::process::exit(113);
+        }
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&1)
             && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
@@ -387,7 +402,19 @@ impl Replica {
         let k = log_key(e.log_id);
         let src = &e.payload.bytes;
         let digest = Sha256::digest(src);
-        let reply = if let Some(m) = e.payload.check_members()? {
+        let reply = if let Some(join) = e.payload.join_command()? {
+            let m = e
+                .payload
+                .check_members()?
+                .ok_or(invalid("missing Join membership"))?;
+            let receipt = self.apply_join(tx, e.log_id, &m, join, &digest)?;
+            put(
+                tx,
+                "membership",
+                &StoredMembershipOf::<Types>::new(Some(e.log_id), m),
+            )?;
+            Reply::Receipt(receipt)
+        } else if let Some(m) = e.payload.check_members()? {
             let mut stmt = tx
                 .prepare("SELECT node FROM participant ORDER BY node")
                 .map_err(io::Error::other)?;
@@ -401,6 +428,8 @@ impl Replica {
                 if let Some(creator) = meta::<crate::genesis::Creator>(tx, "creator")? {
                     let valid_learners = if let Some(previous) = &previous {
                         self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
+                            && previous.membership().voter_ids().eq([creator.node])
+                            && meta::<JoinedMember>(tx, "first_member")?.is_none()
                             && meta::<Vec<u8>>(tx, "lobby")?.is_some()
                             && m.non_write_voter_ids().count() == 1
                             && previous

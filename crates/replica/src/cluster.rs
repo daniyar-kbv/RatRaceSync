@@ -14,12 +14,37 @@ use tokio::time::{sleep, timeout};
 struct Bus(
     Arc<Mutex<BTreeMap<ReplicaId, Raft>>>,
     Arc<Mutex<BTreeMap<ReplicaId, (ReplicaId, LearnerReplication)>>>,
+    Arc<Mutex<Option<std::sync::Weak<GameNode>>>>,
+    Arc<std::sync::atomic::AtomicBool>,
 );
 struct Peer {
     bus: Bus,
     id: ReplicaId,
 }
 impl Peer {
+    async fn learner_vote(
+        &self,
+        sender: ReplicaId,
+        peer: LearnerReplication,
+        r: VoteRequest<Types>,
+        pre: bool,
+    ) -> Result<VoteResponse<Types>, RPCError<Types>> {
+        let host = self
+            .bus
+            .2
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|weak| weak.upgrade());
+        let source = host
+            .map(|node| node.pending_join_election_source(&r, pre, &key()))
+            .transpose()
+            .map_err(|e| Unreachable::new(&e))?
+            .flatten();
+        peer.vote_with_join_source(sender, r, pre, source.as_deref())
+            .await
+            .map_err(|e| Unreachable::new(&e).into())
+    }
     fn raft(&self) -> Result<Raft, RPCError<Types>> {
         self.bus
             .0
@@ -48,6 +73,9 @@ impl RaftNetworkV2<Types> for Peer {
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
         let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
         if let Some((sender, peer)) = learner {
+            if self.bus.3.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Unreachable::from_string("replication interrupted").into());
+            }
             return peer
                 .append_entries(sender, r)
                 .await
@@ -63,6 +91,10 @@ impl RaftNetworkV2<Types> for Peer {
         r: VoteRequest<Types>,
         _: RPCOption,
     ) -> Result<VoteResponse<Types>, RPCError<Types>> {
+        let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
+        if let Some((sender, peer)) = learner {
+            return self.learner_vote(sender, peer, r, false).await;
+        }
         self.raft()?
             .vote(r)
             .await
@@ -73,6 +105,10 @@ impl RaftNetworkV2<Types> for Peer {
         r: VoteRequest<Types>,
         _: RPCOption,
     ) -> Result<VoteResponse<Types>, RPCError<Types>> {
+        let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
+        if let Some((sender, peer)) = learner {
+            return self.learner_vote(sender, peer, r, true).await;
+        }
         self.raft()?
             .pre_vote(r)
             .await

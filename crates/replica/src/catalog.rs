@@ -341,7 +341,7 @@ impl InstallationCatalog {
                 return Err(invalid("active game has no initialized Raft node"));
             }
             if r.lobby_command.is_some() {
-                confirm_creator_read(&node).await?;
+                confirm_pinned_lobby(&node, key.is_some()).await?;
             }
             if format == Some(LobbyFormat::SemanticLinks)
                 && let Some(key) = key
@@ -420,7 +420,7 @@ impl InstallationCatalog {
         let node = GameNode::start(r.creator.node, replica, config, network).await?;
         let result = if let Some(pin) = r.pin {
             if pinned_lobby.is_some() {
-                confirm_creator_read(&node)
+                confirm_pinned_lobby(&node, key.is_some())
                     .await
                     .map(|()| (pin, pinned_lobby))
             } else {
@@ -524,6 +524,15 @@ impl InstallationCatalog {
             std::process::exit(90 + stage as i32)
         }
     }
+}
+
+async fn confirm_pinned_lobby(node: &GameNode, submitting_create: bool) -> io::Result<()> {
+    // A keyless reopen returns the immutable, replay-verified creation receipt.
+    // Once a Join is in the log, transport must start before a quorum can elect.
+    if !submitting_create && node.replica.has_first_join_source()? {
+        return Ok(());
+    }
+    confirm_creator_read(node).await
 }
 
 async fn confirm_creator_read(node: &GameNode) -> io::Result<()> {

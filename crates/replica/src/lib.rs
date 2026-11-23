@@ -1,9 +1,11 @@
-//! Fixed-membership command application.
+//! Durable command application, lobby membership and receipt recovery.
 mod application;
 mod catalog;
 mod genesis;
 mod learner;
-pub use learner::{Learner, LearnerReplication};
+pub use learner::{
+    JoinDelivery, JoinResult, JoinedMember, Learner, LearnerReplication, VotingHistoryRequest,
+};
 mod lobby;
 pub use catalog::{CreatorGame, InstallationCatalog};
 pub use lobby::{CreateLobby, LobbyCreated, LobbyCreation, LobbyStage};

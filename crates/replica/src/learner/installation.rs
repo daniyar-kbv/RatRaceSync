@@ -80,6 +80,15 @@ impl InstallationCatalog {
         }
         Ok(state)
     }
+    pub(super) fn verified_join_prefix(&self, learner: &Learner) -> io::Result<LogId> {
+        let high = self
+            .reserved_learner(learner)?
+            .verified
+            .ok_or(invalid("learner recovery is incomplete"))?;
+        self.recovered_lobby(learner)?
+            .ok_or(invalid("missing verified lobby"))?;
+        Ok(high)
+    }
     /// Resume the catalog-owned generation after restart, including when the
     /// donor is offline. A missing catalog cannot discover or adopt an orphan.
     pub async fn resume_learner<N>(

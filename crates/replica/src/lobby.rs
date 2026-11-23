@@ -87,7 +87,7 @@ pub struct LobbyCreation {
 
 // Explicit typed records for v2. Lengths and integers use network byte order.
 // The original signed protobuf and its payload checksum belong to the archive.
-fn frame(parts: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn frame(parts: &[&[u8]]) -> Vec<u8> {
     let mut record = Vec::new();
     for part in parts {
         record.extend_from_slice(&(part.len() as u64).to_be_bytes());
@@ -116,7 +116,7 @@ impl LobbyCreated {
     }
 }
 
-fn persist_link(
+pub(crate) fn persist_link(
     db: &Connection,
     ledger: &str,
     seq: i64,

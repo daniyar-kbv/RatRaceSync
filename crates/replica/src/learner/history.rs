@@ -20,7 +20,7 @@ pub(super) fn boundary(db: &Connection) -> io::Result<LogId> {
 fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Vec<u8>>> {
     let entry:Option<Vec<u8>>=db.query_row(
         "SELECT l.entry FROM archive a JOIN raft_log l USING(idx)
-        WHERE (a.idx<?1 OR (?2 AND a.idx=?1)) AND substr(a.source,1,1)=x'02' ORDER BY a.idx DESC LIMIT 1",
+        WHERE (a.idx<?1 OR (?2 AND a.idx=?1)) AND substr(a.source,1,1) IN(x'02',x'03') ORDER BY a.idx DESC LIMIT 1",
         params![idx.to_be_bytes(),inclusive],|r|r.get(0)).optional().map_err(io::Error::other)?;
     entry
         .map(|bytes| {
@@ -31,8 +31,15 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                 .ok_or(invalid("invalid historical membership"))?;
             let creator =
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
+            let valid = if let Some(member) = joined_at(db, entry.log_id.index)? {
+                entry.log_id == member.log_id
+                    && members == join::target(creator.node, member.node)
+                    && entry.payload.join_command()?.is_some()
+            } else {
+                members.voter_ids().eq([creator.node])
+            };
             if members.get_joint_config().len() != 1
-                || !members.voter_ids().eq([creator.node])
+                || !valid
                 || members.non_write_voter_ids().count() > 1
             {
                 return Err(invalid("unsupported historical signer configuration"));
@@ -62,7 +69,7 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
     let entry = store::decode::<Entry>(&raw)?;
     let kind = source
         .first()
-        .filter(|k| **k <= 2)
+        .filter(|k| **k <= 3)
         .ok_or(invalid("unknown archived payload"))?;
     if entry.log_id.index != index
         || id != log_key(entry.log_id)
@@ -82,12 +89,22 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
     let effective = config_at(db, index, true)?.ok_or(invalid("missing effective membership"))?;
     let creator =
         store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing signer binding"))?;
-    let binding = message(&[
-        (1, &creator.actor),
-        (2, &creator.key),
-        (3, &creator.node.0),
-        (4, &1u64.to_be_bytes()),
-    ]);
+    let binding = if let Some(member) = joined_at(db, index)? {
+        let mut bindings = [
+            (
+                creator.node,
+                binding(&creator.actor, &creator.key, creator.node),
+            ),
+            (
+                member.node,
+                binding(&member.actor, &member.key, member.node),
+            ),
+        ];
+        bindings.sort_by_key(|x| x.0);
+        message(&[(1, &bindings[0].1), (2, &bindings[1].1)])
+    } else {
+        binding(&creator.actor, &creator.key, creator.node)
+    };
     Ok(message(&[
         (1, ROW),
         (2, &r.session),
@@ -107,9 +124,19 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
         (16, &binding),
     ]))
 }
-fn transcript(r: &Replica, db: &Connection, index: u64) -> io::Result<Vec<u8>> {
+fn binding(actor: &[u8], key: &[u8; 32], node: ReplicaId) -> Vec<u8> {
+    message(&[(1, actor), (2, key), (3, &node.0), (4, &1u64.to_be_bytes())])
+}
+pub(super) fn joined_at(db: &Connection, index: u64) -> io::Result<Option<JoinedMember>> {
+    Ok(store::meta::<JoinedMember>(db, "first_member")?.filter(|m| m.log_id.index <= index))
+}
+pub(super) fn signer_record(
+    r: &Replica,
+    db: &Connection,
+    index: u64,
+    creator: &Creator,
+) -> io::Result<Vec<u8>> {
     let row = checkpoint(r, db, index)?;
-    let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing signer"))?;
     let issue = message(&[(1, ISSUE), (2, &r.session), (3, &row)]);
     Ok(message(&[
         (1, SIGNER),
@@ -119,6 +146,13 @@ fn transcript(r: &Replica, db: &Connection, index: u64) -> io::Result<Vec<u8>> {
         (5, &1u64.to_be_bytes()),
         (6, &creator.key),
     ]))
+}
+fn transcript(r: &Replica, db: &Connection, index: u64) -> io::Result<Vec<u8>> {
+    let signer = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing signer"))?;
+    if joined_at(db, index)?.is_some() {
+        return Err(invalid("two historical voters required"));
+    }
+    signer_record(r, db, index, &signer)
 }
 
 fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> {
@@ -193,7 +227,7 @@ pub(super) fn cursor(db: &Connection) -> io::Result<u64> {
     }
     Ok(next)
 }
-fn get(db: &Connection, index: u64) -> io::Result<Option<Vec<u8>>> {
+pub(super) fn get(db: &Connection, index: u64) -> io::Result<Option<Vec<u8>>> {
     db.query_row(
         "SELECT certificate FROM historic_seal WHERE idx=?",
         [index.to_be_bytes()],
@@ -202,7 +236,7 @@ fn get(db: &Connection, index: u64) -> io::Result<Option<Vec<u8>>> {
     .optional()
     .map_err(io::Error::other)
 }
-fn save(db: &Connection, index: u64, cert: &[u8]) -> io::Result<()> {
+pub(super) fn save(db: &Connection, index: u64, cert: &[u8]) -> io::Result<()> {
     if cursor(db)? != index {
         return Err(invalid("cannot advance over a certificate gap"));
     }
@@ -293,7 +327,9 @@ pub(super) fn verify_prefix(
 ) -> io::Result<()> {
     for i in 0..=high.index {
         let cert = get(db, i)?.ok_or(invalid("historical certificate gap"))?;
-        if authenticate(&cert, key)? != transcript(r, db, i)? {
+        if joined_at(db, i)?.is_some() {
+            quorum::verify_certificate(r, db, i, &cert)?;
+        } else if authenticate(&cert, key)? != transcript(r, db, i)? {
             return Err(invalid("invalid retained historical evidence"));
         }
     }

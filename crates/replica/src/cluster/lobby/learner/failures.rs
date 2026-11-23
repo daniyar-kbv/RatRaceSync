@@ -1,4 +1,5 @@
 use super::*;
+mod join;
 use crate::wire::{fields, message};
 use std::process::Command;
 
@@ -105,6 +106,7 @@ async fn catalog_edits_cannot_substitute_the_recovering_player() {
 }
 
 struct Peers {
+    bus: Bus,
     _host: InstallationCatalog,
     game: CreatorGame,
     catalog: InstallationCatalog,
@@ -213,6 +215,7 @@ impl Peers {
             .await
             .unwrap();
         let peers = Self {
+            bus,
             _host: host,
             game,
             catalog,
