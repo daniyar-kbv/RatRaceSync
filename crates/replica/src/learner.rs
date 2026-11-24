@@ -52,12 +52,22 @@ fn fresh<const N: usize>() -> io::Result<[u8; N]> {
     Ok(bytes)
 }
 
-pub(crate) fn invitation(session: &[u8], packet: &[u8]) -> io::Result<(Creator, SignedGenesis)> {
+pub(crate) fn invitation(
+    session: &[u8],
+    packet: &[u8],
+) -> io::Result<(Creator, SignedGenesis, lobby::LobbyFormat)> {
     if packet.len() > LIMIT || session.len() != 16 {
         return Err(invalid("invalid invitation size"));
     }
     let f = fields(packet, &[1, 2, 3, 4])?;
     let body = fields(f[&2], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])?;
+    let format = [
+        lobby::LobbyFormat::SemanticLinks,
+        lobby::LobbyFormat::Seating,
+    ]
+    .into_iter()
+    .find(|f| body[&11] == genesis::profile_manifest(f.profile()))
+    .ok_or(invalid("unsupported invitation profile"))?;
     if f[&1] != INVITE
         || body[&1] != b"RatRaceSync/genesis/v1"
         || body[&2] != session
@@ -68,7 +78,6 @@ pub(crate) fn invitation(session: &[u8], packet: &[u8]) -> io::Result<(Creator, 
         || body[&7][24..] != 0u64.to_be_bytes()
         || body[&8].len() != 32
         || body[&9] != b"membership-source-1"
-        || body[&11] != genesis::profile_manifest(lobby::LobbyFormat::SemanticLinks.profile())
     {
         return Err(invalid("unsupported lobby invitation"));
     }
@@ -94,7 +103,7 @@ pub(crate) fn invitation(session: &[u8], packet: &[u8]) -> io::Result<(Creator, 
     if body[&8] != Sha256::digest(Source::blank().with_membership(members).bytes).as_slice() {
         return Err(invalid("genesis membership source digest mismatch"));
     }
-    Ok((creator, proof))
+    Ok((creator, proof, format))
 }
 
 pub struct Learner {
@@ -377,7 +386,10 @@ impl CreatorGame {
     /// Share only after the native adapter authenticates and authorizes the peer.
     pub fn learner_invitation(&self) -> io::Result<Vec<u8>> {
         let r = &self.node.replica;
-        if r.lobby_format != Some(lobby::LobbyFormat::SemanticLinks) {
+        if !r
+            .lobby_format
+            .is_some_and(lobby::LobbyFormat::semantic_links)
+        {
             return Err(invalid("unsupported recovery profile"));
         }
         let db = r.lock()?;
@@ -406,7 +418,9 @@ impl CreatorGame {
             r.require_lobby_genesis(&tx)?;
             let creator =
                 store::meta::<Creator>(&tx, "creator")?.ok_or(invalid("missing creator"))?;
-            if r.lobby_format != Some(lobby::LobbyFormat::SemanticLinks)
+            if !r
+                .lobby_format
+                .is_some_and(lobby::LobbyFormat::semantic_links)
                 || store::meta::<Vec<u8>>(&tx, "lobby")?.is_none()
                 || r.local_node != Some(creator.node)
             {

@@ -14,17 +14,22 @@ use sha2::{Digest, Sha256};
 pub(crate) enum LobbyFormat {
     Legacy,
     SemanticLinks,
+    Seating,
 }
 
 impl LobbyFormat {
+    pub(crate) fn semantic_links(self) -> bool {
+        self != Self::Legacy
+    }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::Seating => b"RatRaceSync/Classic101/lobby/v3",
         }
     }
     fn parse(bytes: &[u8]) -> io::Result<Self> {
-        [Self::Legacy, Self::SemanticLinks]
+        [Self::Legacy, Self::SemanticLinks, Self::Seating]
             .into_iter()
             .find(|f| f.profile() == bytes)
             .ok_or(invalid("unsupported Create profile"))
@@ -377,7 +382,7 @@ impl Replica {
                 let (record, tip) = receipt.encode(&prev_receipt, &result_digest);
                 (record, tip, legacy_event_tip)
             }
-            LobbyFormat::SemanticLinks => {
+            LobbyFormat::SemanticLinks | LobbyFormat::Seating => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();
@@ -439,6 +444,9 @@ impl Replica {
         )
         .map_err(io::Error::other)?;
         store::put(tx, "lobby", &data)?;
+        if c.format == LobbyFormat::Seating {
+            store::put(tx, "setup_revision", &created.setup_revision)?;
+        }
         tx.execute(
             "INSERT INTO receipt VALUES(?,?,?,?,?,?)",
             params![seq, c.actor, c.request, fp, record, tip],

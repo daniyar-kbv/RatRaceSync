@@ -174,7 +174,7 @@ pub(crate) fn create_schema(
     db: &Connection,
     lobby_format: Option<lobby::LobbyFormat>,
 ) -> io::Result<()> {
-    if lobby_format == Some(lobby::LobbyFormat::SemanticLinks) {
+    if lobby_format.is_some_and(lobby::LobbyFormat::semantic_links) {
         db.execute_batch("CREATE TABLE semantic_link (
             ledger TEXT NOT NULL CHECK(ledger IN ('event','receipt')), seq INTEGER NOT NULL CHECK(seq>0),
             previous_tip BLOB NOT NULL CHECK(length(previous_tip)=32), record BLOB NOT NULL,

@@ -3,7 +3,7 @@ mod delivery;
 mod restart;
 
 impl Recovery {
-    async fn recover(&mut self) {
+    pub(super) async fn recover(&mut self) {
         let host = &self.p.game.node;
         let other = &self.p.learner.node;
         self.catalog
@@ -16,7 +16,7 @@ impl Recovery {
             .await
             .unwrap();
     }
-    async fn proposal(&self) -> io::Result<Vec<u8>> {
+    pub(super) async fn proposal(&self) -> io::Result<Vec<u8>> {
         self.catalog
             .prepare_third_join(
                 &self.third,

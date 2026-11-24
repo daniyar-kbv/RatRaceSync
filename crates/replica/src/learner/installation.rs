@@ -43,7 +43,7 @@ fn read(db: &Connection) -> io::Result<Reservation> {
 }
 pub(crate) fn check_inventory(db: &Connection) -> io::Result<()> {
     let state = read(db)?;
-    let (creator, _) = invitation(&state.session, &state.invitation)?;
+    let (creator, _, _) = invitation(&state.session, &state.invitation)?;
     let other: bool = db
         .query_row("SELECT EXISTS(SELECT 1 FROM participation)", [], |r| {
             r.get(0)
@@ -76,8 +76,8 @@ impl InstallationCatalog {
         };
         let receipt = db
             .query_row(
-                "SELECT record FROM receipt WHERE seq=2 AND actor=?",
-                [&member.actor],
+                "SELECT r.record FROM receipt r JOIN archive a ON a.receipt_count=r.seq WHERE a.log_id=? AND r.actor=?",
+                params![log_key(member.log_id),&member.actor],
                 |r| r.get(0),
             )
             .map_err(io::Error::other)?;
@@ -89,12 +89,12 @@ impl InstallationCatalog {
     }
     pub(crate) fn verified_learner_pin(&self) -> io::Result<Option<[u8; 32]>> {
         let state = read(&self.db)?;
-        let (_, pin) = invitation(&state.session, &state.invitation)?;
+        let (_, pin, _) = invitation(&state.session, &state.invitation)?;
         Ok(state.verified.map(|_| pin.fingerprint))
     }
     pub(super) fn reserved_learner(&self, learner: &Learner) -> io::Result<Reservation> {
         let state = read(&self.db)?;
-        let (_, pin) = invitation(&state.session, &state.invitation)?;
+        let (_, pin, _) = invitation(&state.session, &state.invitation)?;
         if !state.prepared
             || state.actor != learner.actor
             || state.session != learner.node.replica.session
@@ -216,7 +216,7 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
-        let (creator, proof) = invitation(session, invite)?;
+        let (creator, proof, format) = invitation(session, invite)?;
         if actor.is_empty()
             || actor.len() > 64
             || actor == creator.actor
@@ -277,7 +277,7 @@ impl InstallationCatalog {
             &creator,
             state.id,
             !state.prepared,
-            Some(lobby::LobbyFormat::SemanticLinks),
+            Some(format),
         )
         .await?;
         {

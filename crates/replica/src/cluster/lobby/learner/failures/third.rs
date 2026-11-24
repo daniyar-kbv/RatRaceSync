@@ -2,6 +2,7 @@ use super::*;
 mod election;
 mod promotion;
 mod restart;
+mod seating;
 
 struct Recovery {
     p: Peers,
@@ -12,7 +13,9 @@ struct Recovery {
     join: JoinResult,
 }
 async fn joined_pair(root: &Path, capacity: u8) -> (Peers, JoinResult) {
-    let mut p = Peers::with_capacity(root, capacity).await;
+    finish_pair(Peers::with_capacity(root, capacity).await).await
+}
+async fn finish_pair(mut p: Peers) -> (Peers, JoinResult) {
     p.finish().await;
     let host = &*p.game.node;
     let join = p
@@ -31,7 +34,9 @@ async fn joined_pair(root: &Path, capacity: u8) -> (Peers, JoinResult) {
     (p, join.join)
 }
 async fn admitted_third(root: &Path) -> Recovery {
-    let (p, join) = joined_pair(root, 4).await;
+    admit_to_pair(root, joined_pair(root, 4).await).await
+}
+async fn admit_to_pair(root: &Path, (p, join): (Peers, JoinResult)) -> Recovery {
     let host = &*p.game.node;
     let other = &p.learner.node;
     let path = root.join("third");

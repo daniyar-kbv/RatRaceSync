@@ -184,10 +184,19 @@ impl Peers {
         Self::with_capacity(dir, 4).await
     }
     async fn with_capacity(dir: &Path, capacity: u8) -> Self {
+        Self::with_profile(dir, capacity, crate::lobby::LobbyFormat::SemanticLinks).await
+    }
+    async fn with_profile(dir: &Path, capacity: u8, format: crate::lobby::LobbyFormat) -> Self {
         let mut host = InstallationCatalog::open(&dir.join("creator")).unwrap();
         let bus = Bus::default();
         let game = host
-            .create_lobby(intent(capacity), &key(), Config::default(), bus.clone())
+            .create_lobby_for_profile(
+                intent(capacity),
+                &key(),
+                Config::default(),
+                bus.clone(),
+                format,
+            )
             .await
             .unwrap();
         bus.0

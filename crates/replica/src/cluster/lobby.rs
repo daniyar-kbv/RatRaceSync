@@ -7,6 +7,61 @@ mod review;
 
 const REQUEST: [u8; 16] = [2, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1];
 
+#[tokio::test]
+async fn public_create_enables_claims_and_respects_an_existing_profile_on_retry() {
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = InstallationCatalog::open(dir.path()).unwrap();
+        let prior = if existing {
+            let old = catalog
+                .create_lobby_for_profile(
+                    intent(2),
+                    &key(),
+                    Config::default(),
+                    Bus::default(),
+                    crate::lobby::LobbyFormat::SemanticLinks,
+                )
+                .await
+                .unwrap();
+            let original = (old.fingerprint, old.lobby.clone());
+            old.node.raft.shutdown().await.unwrap();
+            drop(old);
+            drop(catalog);
+            catalog = InstallationCatalog::open(dir.path()).unwrap();
+            Some(original)
+        } else {
+            None
+        };
+        let game = create(&mut catalog, intent(2)).await.unwrap();
+        let guard = game
+            .node
+            .seat_claim_guard(ACTOR, SeatId::new(1).unwrap())
+            .await;
+        if let Some((pin, original)) = prior {
+            assert_eq!((game.fingerprint, game.lobby), (pin, original));
+            assert!(guard.is_err());
+        } else {
+            let mut request = REQUEST;
+            request[15] += 1;
+            let signed = game
+                .node
+                .prepare_seat_claim(&guard.unwrap(), request, &key())
+                .unwrap();
+            assert!(matches!(
+                game.node.submit(signed).await.unwrap(),
+                Reply::Receipt(_)
+            ));
+            assert_eq!(
+                game.node.lobby_seating(ACTOR).await.unwrap().seats[0]
+                    .occupant
+                    .as_deref(),
+                Some(ACTOR)
+            );
+        }
+        game.node.raft.shutdown().await.unwrap();
+    }
+}
+
 fn intent(target: u8) -> CreateLobby<'static> {
     CreateLobby {
         request: REQUEST,

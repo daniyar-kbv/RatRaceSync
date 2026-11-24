@@ -203,7 +203,7 @@ pub(super) fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> 
             wire::field(&mut out, tag, &[]);
             continue;
         }
-        if previous.checked_add(1) != Some(count) || !(1..=3).contains(&count) {
+        if previous.checked_add(1) != Some(count) || count <= 0 {
             return Err(invalid("unsupported lobby archive delta"));
         }
         let sql = format!(

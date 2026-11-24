@@ -178,7 +178,7 @@ impl InstallationCatalog {
         request: [u8; 16],
         actor: &[u8],
         key: &SigningKey,
-        lobby: Option<CreateLobby<'_>>,
+        lobby: Option<(CreateLobby<'_>, LobbyFormat)>,
     ) -> io::Result<Reservation> {
         if database_version(&self.db)? == 3 {
             return Err(invalid("learner owns the participation slot"));
@@ -191,22 +191,24 @@ impl InstallationCatalog {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(io::Error::other)?;
         let capacity = lobby
-            .map(|input| LobbyCapacity::new(input.target).ok_or(invalid("invalid lobby capacity")))
+            .map(|(input, _)| {
+                LobbyCapacity::new(input.target).ok_or(invalid("invalid lobby capacity"))
+            })
             .transpose()?;
         let existing = Self::reservation(&tx)?;
         let r = if let Some(existing) = existing {
             existing
         } else {
-            if lobby.is_some_and(|input| !input.profile_complete || !input.can_host) {
+            if lobby.is_some_and(|(input, _)| !input.profile_complete || !input.can_host) {
                 return Err(invalid("local profile or hosting eligibility unavailable"));
             }
             ensure_empty_inventory(&self.directory)?;
             tx.execute("INSERT INTO participation(slot,request,session,actor,public_key,node) VALUES(1,?,randomblob(16),?,?,randomblob(16))",
             params![request,actor,key.verifying_key().as_bytes()]).map_err(io::Error::other)?;
             let mut r = Self::reservation(&tx)?.ok_or(invalid("missing reservation"))?;
-            if let Some(capacity) = capacity {
+            if let (Some(capacity), Some((_, format))) = (capacity, lobby) {
                 let signed = LobbyCommand {
-                    format: LobbyFormat::SemanticLinks,
+                    format,
                     session: &r.session,
                     actor,
                     request,
@@ -274,7 +276,23 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
-        let r = self.reserve(input.request, input.actor, key, Some(input))?;
+        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::Seating)
+            .await
+    }
+
+    pub(crate) async fn create_lobby_for_profile<N>(
+        &mut self,
+        input: CreateLobby<'_>,
+        key: &SigningKey,
+        config: Config,
+        network: N,
+        format: LobbyFormat,
+    ) -> io::Result<CreatorGame>
+    where
+        N: RaftNetworkFactory<Types>,
+        N::Network: NetSnapshot<Types, SnapshotData = ()>,
+    {
+        let r = self.reserve(input.request, input.actor, key, Some((input, format)))?;
         #[cfg(test)]
         self.interrupt_at(1);
         self.resume(r, Some(key), config, network).await
@@ -343,7 +361,7 @@ impl InstallationCatalog {
             if r.lobby_command.is_some() {
                 confirm_pinned_lobby(&node, key.is_some()).await?;
             }
-            if format == Some(LobbyFormat::SemanticLinks)
+            if format.is_some_and(LobbyFormat::semantic_links)
                 && let Some(key) = key
             {
                 node.enable_sealer(key)?;
@@ -437,7 +455,7 @@ impl InstallationCatalog {
             }
         };
         let node = Arc::new(node);
-        if format == Some(LobbyFormat::SemanticLinks)
+        if format.is_some_and(LobbyFormat::semantic_links)
             && let Some(key) = key
             && let Err(error) = node.enable_sealer(key)
         {

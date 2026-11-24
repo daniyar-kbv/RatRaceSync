@@ -69,7 +69,9 @@ fn parse<'a>(r: &Replica, raw: &'a [u8]) -> io::Result<Intent<'a>> {
     let key = fixed(binding[&5])?;
     let root = r.bound_root.get().ok_or(invalid("unverified Join root"))?;
     let request = fixed::<16>(body[&4])?;
-    if r.lobby_format != Some(lobby::LobbyFormat::SemanticLinks)
+    if !r
+        .lobby_format
+        .is_some_and(lobby::LobbyFormat::semantic_links)
         || body[&1] != r.profile()
         || body[&2] != r.session
         || actor.is_empty()
@@ -260,9 +262,7 @@ impl InstallationCatalog {
         let lobby = created(&tx)?;
         let m = history::membership(&tx)?;
         let membership = log_key(m.log_id().ok_or(invalid("missing membership source"))?);
-        let setup = store::meta::<JoinedMember>(&tx, "first_member")?
-            .map_or(lobby.setup_revision, |m| m.setup_revision)
-            .to_be_bytes();
+        let setup = seating::setup_revision(&tx)?.to_be_bytes();
         let layout = lobby.layout_revision.to_be_bytes();
         let guard = message(&[(1, &setup), (2, &layout), (3, &membership)]);
         let leaf = message(&[(1, &learner.id.0), (2, &admission)]);
@@ -345,7 +345,7 @@ impl Intent<'_> {
             .ok_or(invalid("missing committed membership"))?;
         let lobby = created(db)?;
         let first = store::meta::<JoinedMember>(db, "first_member")?;
-        let (prior_voters, target, revision, ordinal, slot) = if let Some(member) = first {
+        let (prior_voters, target, ordinal, slot) = if let Some(member) = first {
             if self.actor == member.actor
                 || self.key == member.key
                 || self.node == member.node
@@ -356,7 +356,6 @@ impl Intent<'_> {
             (
                 target(creator.node, member.node),
                 promotion::roster(creator.node, member.node, self.node),
-                member.setup_revision,
                 3,
                 "third_member",
             )
@@ -364,7 +363,6 @@ impl Intent<'_> {
             (
                 Members::new_with_defaults(vec![[creator.node].into()], []),
                 target(creator.node, self.node),
-                lobby.setup_revision,
                 2,
                 "first_member",
             )
@@ -376,7 +374,7 @@ impl Intent<'_> {
             || self.key == creator.key
             || self.node == creator.node
             || self.membership != log_key(prior)
-            || self.setup != revision
+            || self.setup != seating::setup_revision(db)?
             || self.layout != lobby.layout_revision
             || lobby.target < ordinal
             || lobby.stage != LobbyStage::Open as i32
@@ -621,10 +619,13 @@ impl Replica {
         ]);
         let (events, prev_event) = self.tip(db, "event")?;
         let (receipts, prev_receipt) = self.tip(db, "receipt")?;
-        let sequence = i64::from(change.ordinal);
-        if (events, receipts) != (sequence - 1, sequence - 1) {
+        if self.lobby_format != Some(lobby::LobbyFormat::Seating)
+            && (events, receipts) != (i64::from(change.ordinal) - 1, i64::from(change.ordinal) - 1)
+        {
             return Err(invalid("unexpected history before Join"));
         }
+        let sequence = events.checked_add(1).ok_or(invalid("event range"))?;
+        let receipt_seq = receipts.checked_add(1).ok_or(invalid("receipt range"))?;
         let seq = sequence.to_be_bytes();
         let id = wire::hash(b"event-id", &[&self.session, &kbytes, &seq]);
         let mut facts = vec![
@@ -664,13 +665,23 @@ impl Replica {
             &prev_event,
             &frame(&[b"MemberJoined/v1", &semantic]),
         )?;
+        let receipt_fields = if self.lobby_format == Some(lobby::LobbyFormat::Seating) {
+            frame(&[
+                b"JoinReceipt/v2",
+                &receipt_seq.to_be_bytes(),
+                &12u16.to_be_bytes(),
+                &semantic,
+            ])
+        } else {
+            frame(&[b"JoinReceipt/v1", &12u16.to_be_bytes(), &semantic])
+        };
         let rt = persist_link(
             db,
             "receipt",
-            sequence,
+            receipt_seq,
             b"receipt-step/v2",
             &prev_receipt,
-            &frame(&[b"JoinReceipt/v1", &12u16.to_be_bytes(), &semantic]),
+            &receipt_fields,
         )?;
         let event = message(&[
             (1, &self.session),
@@ -688,7 +699,7 @@ impl Replica {
             request: &command.request,
             fingerprint: &command.fingerprint,
             log: &kbytes,
-            seq: sequence,
+            seq: receipt_seq,
             outcome: &result,
             refs: &id,
             source_digest: digest,
@@ -708,7 +719,7 @@ impl Replica {
         db.execute(
             "INSERT INTO receipt VALUES(?,?,?,?,?,?)",
             params![
-                sequence,
+                receipt_seq,
                 command.actor,
                 command.request,
                 command.fingerprint,
@@ -718,6 +729,9 @@ impl Replica {
         )
         .map_err(io::Error::other)?;
         store::put(db, change.slot, &member)?;
+        if self.lobby_format == Some(lobby::LobbyFormat::Seating) {
+            store::put(db, "setup_revision", &member.setup_revision)?;
+        }
         Ok(receipt)
     }
 }

@@ -12,6 +12,9 @@ pub use catalog::{CreatorGame, InstallationCatalog};
 pub use lobby::{CreateLobby, LobbyCreated, LobbyCreation, LobbyStage};
 mod node;
 mod recovery;
+mod seating;
+pub use rat_race_engine::SeatId;
+pub use seating::{LobbySeat, LobbySeatView, SeatClaimGuard};
 mod store;
 mod types;
 mod wire;
@@ -169,6 +172,7 @@ impl Replica {
         let version = database_version(&db)?;
         let expected_version = match lobby_format {
             Some(lobby::LobbyFormat::SemanticLinks) => 4,
+            Some(lobby::LobbyFormat::Seating) => 5,
             Some(lobby::LobbyFormat::Legacy) => 3,
             None if creator.is_some() => 2,
             None => 1,

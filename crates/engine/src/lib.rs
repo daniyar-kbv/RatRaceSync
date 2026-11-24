@@ -3,7 +3,7 @@
 mod integer;
 mod lobby;
 pub use integer::{Integer, InvalidInteger};
-pub use lobby::LobbyCapacity;
+pub use lobby::{ClaimError, LobbyCapacity, LobbySeating, SeatId};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -20,6 +20,12 @@ fn identifier_bytes(bytes: &[u8]) -> Result<Box<[u8]>, EmptyIdentifier> {
         return Err(EmptyIdentifier);
     }
     Ok(bytes.into())
+}
+
+impl AsRef<[u8]> for PlayerId {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 impl TryFrom<&[u8]> for PlayerId {

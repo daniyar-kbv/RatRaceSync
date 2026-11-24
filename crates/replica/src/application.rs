@@ -224,6 +224,9 @@ impl Replica {
         let db = self.lock()?;
         self.verify_checkpoint(&db)?;
         if self.lobby_format.is_some() {
+            if seating::is_claim(&signed.0) {
+                return self.inspect_claim(&db, &signed.0);
+            }
             return self.inspect_lobby(&db, signed);
         }
         let (c, reply) = self.inspect(&db, &signed.0)?;
@@ -451,7 +454,9 @@ impl Replica {
                             m.voter_ids().eq([creator.node]) && m.non_write_voter_ids().count() == 1
                         };
                     roster_matches
-                        && self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
+                        && self
+                            .lobby_format
+                            .is_some_and(crate::lobby::LobbyFormat::semantic_links)
                         && meta::<Vec<u8>>(tx, "lobby")?.is_some()
                         && prior.get_joint_config() == m.get_joint_config()
                         && prior
@@ -485,7 +490,11 @@ impl Replica {
             Reply::Protocol
         } else if let Some(raw) = src.strip_prefix(&[1]) {
             if self.lobby_format.is_some() {
-                self.apply_lobby(tx, &k, raw, &digest)?
+                if seating::is_claim(raw) {
+                    self.apply_claim(tx, e.log_id, raw, &digest)?
+                } else {
+                    self.apply_lobby(tx, &k, raw, &digest)?
+                }
             } else {
                 self.apply_command(tx, &k, raw, &digest)?
             }
