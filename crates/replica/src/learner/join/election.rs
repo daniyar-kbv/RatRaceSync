@@ -44,7 +44,14 @@ impl GameNode {
         let Some(membership_id) = *effective.log_id() else {
             return Ok(None);
         };
-        if effective.membership().voter_ids().count() != 2 || membership_id.index > last.index {
+        if effective.membership().voter_ids().count() != 2
+            || effective
+                .membership()
+                .non_write_voter_ids()
+                .next()
+                .is_some()
+            || membership_id.index > last.index
+        {
             return Ok(None);
         }
         let r = &self.replica;

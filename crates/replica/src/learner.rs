@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 mod history;
 mod join;
 mod quorum;
+pub(crate) mod third;
 pub use join::{JoinDelivery, JoinResult, JoinedMember};
 pub use quorum::VotingHistoryRequest;
 mod installation;
@@ -133,7 +134,10 @@ impl LearnerReplication {
         pre_vote: bool,
         source: Option<&[u8]>,
     ) -> io::Result<openraft::raft::VoteResponse<Types>> {
-        if sender != self.creator || request.vote.leader_id.node_id != sender {
+        if sender != self.creator
+            || request.vote.leader_id.node_id != sender
+            || third::local_route(&self.replica, &*self.replica.lock()?)?.is_some()
+        {
             return Err(invalid("vote outside authorized two-voter configuration"));
         }
         if !self.raft.voter_ids().any(|id| id == self.local) {
@@ -155,6 +159,15 @@ impl LearnerReplication {
         authenticated_sender: ReplicaId,
         request: openraft::raft::AppendEntriesRequest<Types>,
     ) -> io::Result<openraft::raft::AppendResult<Types>> {
+        let route = { third::local_route(&self.replica, &*self.replica.lock()?)? };
+        if let Some(route) = route {
+            route.check_replication(self.creator, authenticated_sender, &request)?;
+            return self
+                .raft
+                .append_entries(request)
+                .await
+                .map_err(io::Error::other);
+        }
         if authenticated_sender != self.creator || request.vote.leader_id.node_id != self.creator {
             return Err(invalid("replication sender differs from pinned creator"));
         }
@@ -164,9 +177,15 @@ impl LearnerReplication {
                 continue;
             }
             if let Some(m) = entry.payload.check_members()? {
-                if store::meta::<JoinedMember>(&*self.replica.lock()?, "first_member")?
-                    .is_some_and(|member| entry.log_id.index >= member.log_id.index)
+                if let Some(member) =
+                    store::meta::<JoinedMember>(&*self.replica.lock()?, "first_member")?
+                    && entry.log_id.index >= member.log_id.index
                 {
+                    if member.node == self.local
+                        && third::registration(&m, self.creator, member.node)
+                    {
+                        continue;
+                    }
                     return Err(invalid("unrequested change to joined voting membership"));
                 }
                 let valid_targets = if entry.log_id.index == 0 {
@@ -241,9 +260,10 @@ impl Learner {
         let db = self.node.replica.lock()?;
         let nonce = fresh::<32>()?;
         let next = history::cursor(&db)?;
+        let route = store::meta::<Vec<u8>>(&db, "local_recovery_route")?;
         let body = message(&[
             (1, REQUEST),
-            (2, &admission),
+            (2, route.as_deref().unwrap_or(&admission)),
             (3, &nonce),
             (4, &next.to_be_bytes()),
         ]);
@@ -252,6 +272,31 @@ impl Learner {
     }
 }
 
+fn admission_fields<'a>(
+    r: &Replica,
+    packet: &'a [u8],
+    creator: &Creator,
+) -> io::Result<BTreeMap<u32, &'a [u8]>> {
+    if packet.len() > 4096 {
+        return Err(invalid("admission too large"));
+    }
+    let body = fields(packet, &[1, 2])?[&1];
+    let f = fields(body, &[1, 2, 3, 4, 5, 6])?;
+    let key = fixed(f[&5])?;
+    authenticate(packet, &key)?;
+    if f[&1] != ADMIT
+        || f[&2] != r.session
+        || Some(&fixed(f[&3])?) != r.bound_root.get()
+        || f[&4].is_empty()
+        || f[&4].len() > 64
+        || f[&4] == creator.actor
+        || key == creator.key
+        || ReplicaId(fixed(f[&6])?) == creator.node
+    {
+        return Err(invalid("invalid learner identity or lobby binding"));
+    }
+    Ok(f)
+}
 impl CreatorGame {
     /// Share only after the native adapter authenticates and authorizes the peer.
     pub fn learner_invitation(&self) -> io::Result<Vec<u8>> {
@@ -269,31 +314,6 @@ impl CreatorGame {
             (3, &proof.signature),
             (4, &proof.fingerprint),
         ]))
-    }
-    fn admission_fields<'a>(
-        &self,
-        packet: &'a [u8],
-        creator: &Creator,
-    ) -> io::Result<BTreeMap<u32, &'a [u8]>> {
-        if packet.len() > 4096 {
-            return Err(invalid("admission too large"));
-        }
-        let body = fields(packet, &[1, 2])?[&1];
-        let f = fields(body, &[1, 2, 3, 4, 5, 6])?;
-        let key = fixed(f[&5])?;
-        authenticate(packet, &key)?;
-        if f[&1] != ADMIT
-            || f[&2] != self.node.replica.session
-            || Some(&fixed(f[&3])?) != self.node.replica.bound_root.get()
-            || f[&4].is_empty()
-            || f[&4].len() > 64
-            || f[&4] == creator.actor
-            || key == creator.key
-            || ReplicaId(fixed(f[&6])?) == creator.node
-        {
-            return Err(invalid("invalid learner identity or lobby binding"));
-        }
-        Ok(f)
     }
     /// The trusted admission adapter supplies a verified peer's signed intent.
     /// This adds one replication target under the existing sole voter.
@@ -318,7 +338,7 @@ impl CreatorGame {
                     "learner admission requires the original lobby host",
                 ));
             }
-            let f = self.admission_fields(admission, &creator)?;
+            let f = admission_fields(r, admission, &creator)?;
             let id = ReplicaId(fixed(f[&6])?);
             match store::meta::<Vec<u8>>(&tx, "learner_admission")? {
                 Some(saved) if saved != admission => {
@@ -375,7 +395,7 @@ impl CreatorGame {
         let tx = db.transaction().map_err(io::Error::other)?;
         r.require_lobby_genesis(&tx)?;
         let creator = store::meta::<Creator>(&tx, "creator")?.ok_or(invalid("missing creator"))?;
-        let admission = self.admission_fields(f[&2], &creator)?;
+        let admission = admission_fields(r, f[&2], &creator)?;
         let m = history::membership(&tx)?;
         if creator.key != key.verifying_key().to_bytes()
             || r.local_node != Some(creator.node)

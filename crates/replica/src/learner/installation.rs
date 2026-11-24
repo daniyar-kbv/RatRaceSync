@@ -61,6 +61,32 @@ pub(crate) fn check_inventory(db: &Connection) -> io::Result<()> {
 }
 
 impl InstallationCatalog {
+    /// Original Join at the catalog's verified checkpoint, including after an offline restart.
+    pub fn recovered_join(&self, learner: &Learner) -> io::Result<Option<JoinResult>> {
+        if self.recovered_lobby(learner)?.is_none() {
+            return Ok(None);
+        }
+        let high = self
+            .reserved_learner(learner)?
+            .verified
+            .ok_or(invalid("missing recovery checkpoint"))?;
+        let db = learner.node.replica.lock()?;
+        let Some(member) = history::joined_at(&db, high.index)? else {
+            return Ok(None);
+        };
+        let receipt = db
+            .query_row(
+                "SELECT record FROM receipt WHERE seq=2 AND actor=?",
+                [&member.actor],
+                |r| r.get(0),
+            )
+            .map_err(io::Error::other)?;
+        Ok(Some(JoinResult {
+            log_id: member.log_id,
+            member,
+            receipt,
+        }))
+    }
     pub(crate) fn verified_learner_pin(&self) -> io::Result<Option<[u8; 32]>> {
         let state = read(&self.db)?;
         let (_, pin) = invitation(&state.session, &state.invitation)?;
@@ -138,7 +164,8 @@ impl InstallationCatalog {
         self.reserved_learner(learner)?;
         loop {
             let response = exchange(learner.request(key)?).await?;
-            let body = authenticate(&response, &learner.creator.key)?;
+            let route = third::local_route(&learner.node.replica, &*learner.node.replica.lock()?)?;
+            let body = third::response_body(&response, &learner.creator, route.as_ref())?;
             let f = fields(body, &[1, 2, 3, 4, 5])?;
             let pending = learner
                 .pending
@@ -319,7 +346,8 @@ impl InstallationCatalog {
             .pending
             .as_ref()
             .ok_or(invalid("no outstanding challenge"))?;
-        let body = authenticate(response, &learner.creator.key)?;
+        let route = third::local_route(&learner.node.replica, &*learner.node.replica.lock()?)?;
+        let body = third::response_body(response, &learner.creator, route.as_ref())?;
         let f = fields(body, &[1, 2, 3, 4, 5])?;
         if f[&1] != RESPONSE || f[&2] != Sha256::digest(pending).as_slice() {
             return Err(invalid("stale recovery response"));
@@ -343,6 +371,12 @@ impl InstallationCatalog {
             }
             [1] => {
                 let high = history::boundary(&tx)?;
+                if history::joined_at(&tx, high.index)?.is_some() != route.is_some() {
+                    return Err(invalid("checkpoint signer configuration mismatch"));
+                }
+                if let Some(route) = &route {
+                    route.verify_historical_join(r, &tx, route.join)?;
+                }
                 if f[&3] != log_key(high)
                     || high.index.checked_add(1) != Some(index)
                     || history::cursor(&tx)? != index
@@ -418,7 +452,17 @@ fn validate_completion(
     let (request, response) =
         store::meta::<(Vec<u8>, Vec<u8>)>(db, &format!("learner_completion_{}", high.index))?
             .ok_or(invalid("verified learner lost its completion evidence"))?;
-    let fresh = fields(authenticate(&response, &creator.key)?, &[1, 2, 3, 4, 5])?;
+    let route = third::local_route(r, db)?;
+    if history::joined_at(db, high.index)?.is_some() != route.is_some() {
+        return Err(invalid("wrong recovery authority for pinned checkpoint"));
+    }
+    if let Some(route) = &route {
+        route.verify_historical_join(r, db, route.join)?;
+    }
+    let fresh = fields(
+        third::response_body(&response, creator, route.as_ref())?,
+        &[1, 2, 3, 4, 5],
+    )?;
     let query = fields(&request, &[1, 2, 3, 4])?;
     if fresh[&1] != RESPONSE
         || fresh[&2] != Sha256::digest(&request).as_slice()
@@ -426,7 +470,10 @@ fn validate_completion(
         || fresh[&4] != [1]
         || fresh[&5] != history::checkpoint(r, db, high.index)?
         || query[&1] != REQUEST
-        || query[&2] != binding
+        || query[&2]
+            != store::meta::<Vec<u8>>(db, "local_recovery_route")?
+                .as_deref()
+                .unwrap_or(binding)
         || query[&3].len() != 32
         || Some(u64::from_be_bytes(fixed(query[&4])?)) != high.index.checked_add(1)
     {

@@ -146,7 +146,7 @@ pub(super) fn sealed_range(
     }
     Ok(sha.finalize().into())
 }
-fn created(db: &Connection) -> io::Result<LobbyCreated> {
+pub(super) fn created(db: &Connection) -> io::Result<LobbyCreated> {
     let bytes = store::meta::<Vec<u8>>(db, "lobby")?.ok_or(invalid("missing open lobby"))?;
     LobbyCreated::decode(&*bytes).map_err(io::Error::other)
 }
@@ -202,6 +202,9 @@ impl InstallationCatalog {
         let r = &learner.node.replica;
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
+        if third::local_route(r, &tx)?.is_some() {
+            return Err(invalid("recovery learner is outside the first-player Join"));
+        }
         let saved = store::meta::<Vec<u8>>(&tx, "local_join")?;
         if let Some(raw) = &saved {
             let original = parse(r, raw)?;

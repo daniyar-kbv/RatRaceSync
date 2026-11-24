@@ -1,5 +1,6 @@
 use super::*;
 mod join;
+mod third;
 use crate::wire::{fields, message};
 use std::process::Command;
 
@@ -180,10 +181,13 @@ async fn transfer_resumes_after_disconnect_and_reopens_without_discovery() {
 }
 impl Peers {
     async fn open(dir: &Path) -> Self {
+        Self::with_capacity(dir, 4).await
+    }
+    async fn with_capacity(dir: &Path, capacity: u8) -> Self {
         let mut host = InstallationCatalog::open(&dir.join("creator")).unwrap();
         let bus = Bus::default();
         let game = host
-            .create_lobby(intent(4), &key(), Config::default(), bus.clone())
+            .create_lobby(intent(capacity), &key(), Config::default(), bus.clone())
             .await
             .unwrap();
         bus.0

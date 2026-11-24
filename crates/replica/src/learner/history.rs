@@ -32,9 +32,12 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
             let creator =
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
             let valid = if let Some(member) = joined_at(db, entry.log_id.index)? {
-                entry.log_id == member.log_id
+                (entry.log_id == member.log_id
                     && members == join::target(creator.node, member.node)
-                    && entry.payload.join_command()?.is_some()
+                    && entry.payload.join_command()?.is_some())
+                    || (entry.log_id.index > member.log_id.index
+                        && third::registration(&members, creator.node, member.node)
+                        && entry.payload.join_command()?.is_none())
             } else {
                 members.voter_ids().eq([creator.node])
             };
@@ -155,7 +158,7 @@ fn transcript(r: &Replica, db: &Connection, index: u64) -> io::Result<Vec<u8>> {
     signer_record(r, db, index, &signer)
 }
 
-fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> {
+pub(super) fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> {
     let (source, events, receipts): (Vec<u8>, i64, i64) = db
         .query_row(
             "SELECT source,event_count,receipt_count FROM archive WHERE idx=?",
@@ -182,7 +185,7 @@ fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> {
             wire::field(&mut out, tag, &[]);
             continue;
         }
-        if previous.checked_add(1) != Some(count) || count != 1 {
+        if previous.checked_add(1) != Some(count) || !(1..=2).contains(&count) {
             return Err(invalid("unsupported lobby archive delta"));
         }
         let sql = format!(
@@ -297,9 +300,25 @@ pub(super) fn stage(
             "waiting for local Raft apply",
         ));
     }
-    if authenticate(f[&1], &learner.creator.key)? != transcript(r, db, index)?
-        || f[&2] != archive_piece(db, index)?
-    {
+    verify_seal(r, db, &learner.creator.key, index, f[&1])?;
+    if joined_at(db, index)?.is_some_and(|m| m.log_id.index == index) {
+        let raw: Vec<u8> = db
+            .query_row(
+                "SELECT entry FROM raft_log WHERE idx=?",
+                [index.to_be_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(io::Error::other)?;
+        let entry = store::decode::<Entry>(&raw)?;
+        r.verify_join_coverage(
+            db,
+            entry
+                .payload
+                .join_command()?
+                .ok_or(invalid("missing original Join"))?,
+        )?;
+    }
+    if f[&2] != archive_piece(db, index)? {
         return Err(invalid(
             "archive or historical evidence differs from applied replica",
         ));
@@ -327,11 +346,22 @@ pub(super) fn verify_prefix(
 ) -> io::Result<()> {
     for i in 0..=high.index {
         let cert = get(db, i)?.ok_or(invalid("historical certificate gap"))?;
-        if joined_at(db, i)?.is_some() {
-            quorum::verify_certificate(r, db, i, &cert)?;
-        } else if authenticate(&cert, key)? != transcript(r, db, i)? {
-            return Err(invalid("invalid retained historical evidence"));
-        }
+        verify_seal(r, db, key, i, &cert)?;
     }
     Ok(())
+}
+pub(super) fn verify_seal(
+    r: &Replica,
+    db: &Connection,
+    key: &[u8; 32],
+    i: u64,
+    cert: &[u8],
+) -> io::Result<()> {
+    if joined_at(db, i)?.is_some() {
+        quorum::verify_certificate(r, db, i, cert)
+    } else if authenticate(cert, key)? == transcript(r, db, i)? {
+        Ok(())
+    } else {
+        Err(invalid("invalid retained historical evidence"))
+    }
 }

@@ -340,14 +340,24 @@ impl Replica {
         // A duplicate can already be committed when a retry bypasses preflight.
         // Check the pre-entry state inside this transaction before acknowledging
         // any stored Create outcome. Scratch replay calls apply_in_transaction.
+        let mut recovery_route = None;
         if self.lobby_format.is_some() && matches!(e.payload.bytes.first(), Some(1 | 3)) {
             self.require_lobby_genesis(&tx)?;
             self.verify_replay(&tx)?;
             if let Some(raw) = e.payload.join_command()? {
-                self.verify_join_coverage(&tx, raw)?;
+                recovery_route = learner::third::local_route(self, &tx)?;
+                if recovery_route.is_none() {
+                    self.verify_join_coverage(&tx, raw)?;
+                }
             }
         }
         let reply = self.apply_in_transaction(&tx, &e)?;
+        if let Some(route) = recovery_route {
+            // Historical replay at a third installation. The original certificate
+            // binds this exact applied row before commit. Staging later checks
+            // the Join's signed predecessor range before advancing its cursor.
+            route.verify_historical_join(self, &tx, e.log_id)?;
+        }
         #[cfg(test)]
         if e.payload.bytes.first() == Some(&3)
             && self.crash.load(std::sync::atomic::Ordering::Acquire) == 2
@@ -424,27 +434,33 @@ impl Replica {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(io::Error::other)?;
             let previous = meta::<StoredMembershipOf<Types>>(tx, "membership")?;
-            let valid_roster =
-                if let Some(creator) = meta::<crate::genesis::Creator>(tx, "creator")? {
-                    let valid_learners = if let Some(previous) = &previous {
-                        self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
-                            && previous.membership().voter_ids().eq([creator.node])
-                            && meta::<JoinedMember>(tx, "first_member")?.is_none()
-                            && meta::<Vec<u8>>(tx, "lobby")?.is_some()
-                            && m.non_write_voter_ids().count() == 1
-                            && previous
-                                .membership()
-                                .non_write_voter_ids()
-                                .all(|id| m.non_write_voter_ids().any(|n| n == id))
-                    } else {
-                        prev.is_none()
-                    };
-                    valid_learners && voters.is_empty() && m.voter_ids().eq([creator.node])
+            let valid_roster = if let Some(creator) =
+                meta::<crate::genesis::Creator>(tx, "creator")?
+            {
+                let valid = if let Some(previous) = &previous {
+                    let prior = previous.membership();
+                    let roster_matches =
+                        if let Some(member) = meta::<JoinedMember>(tx, "first_member")? {
+                            learner::third::registration(&m, creator.node, member.node)
+                        } else {
+                            m.voter_ids().eq([creator.node]) && m.non_write_voter_ids().count() == 1
+                        };
+                    roster_matches
+                        && self.lobby_format == Some(crate::lobby::LobbyFormat::SemanticLinks)
+                        && meta::<Vec<u8>>(tx, "lobby")?.is_some()
+                        && prior.get_joint_config() == m.get_joint_config()
+                        && prior
+                            .non_write_voter_ids()
+                            .all(|id| m.non_write_voter_ids().any(|n| n == id))
                 } else {
-                    previous.is_none()
-                        && (2..=10).contains(&voters.len())
-                        && voters.into_iter().map(ReplicaId).eq(m.voter_ids())
+                    prev.is_none() && m.voter_ids().eq([creator.node])
                 };
+                voters.is_empty() && valid
+            } else {
+                previous.is_none()
+                    && (2..=10).contains(&voters.len())
+                    && voters.into_iter().map(ReplicaId).eq(m.voter_ids())
+            };
             if !valid_roster
                 || m.get_joint_config().len() != 1
                 || (previous.is_none() && m.non_write_voter_ids().next().is_some())
