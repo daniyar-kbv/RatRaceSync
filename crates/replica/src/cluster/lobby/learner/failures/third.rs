@@ -1,5 +1,6 @@
 use super::*;
 mod election;
+mod promotion;
 mod restart;
 
 struct Recovery {

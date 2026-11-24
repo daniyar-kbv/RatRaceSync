@@ -12,7 +12,7 @@ mod history;
 mod join;
 mod quorum;
 pub(crate) mod third;
-pub use join::{JoinDelivery, JoinResult, JoinedMember};
+pub use join::{JoinDelivery, JoinResult, JoinedMember, PromotionAuthority, ThirdJoinTransport};
 pub use quorum::VotingHistoryRequest;
 mod installation;
 mod sealing;
@@ -134,13 +134,31 @@ impl LearnerReplication {
         pre_vote: bool,
         source: Option<&[u8]>,
     ) -> io::Result<openraft::raft::VoteResponse<Types>> {
-        if sender != self.creator
-            || request.vote.leader_id.node_id != sender
-            || third::local_route(&self.replica, &*self.replica.lock()?)?.is_some()
-        {
-            return Err(invalid("vote outside authorized two-voter configuration"));
+        let voters: Vec<_> = self.raft.voter_ids().collect();
+        if sender == self.local || request.vote.leader_id.node_id != sender {
+            return Err(invalid("incorrect authenticated candidate"));
         }
-        if !self.raft.voter_ids().any(|id| id == self.local) {
+        if !(voters.contains(&self.local) && voters.contains(&sender))
+            && (sender != self.creator
+                || third::local_route(&self.replica, &*self.replica.lock()?)?.is_some())
+        {
+            let k = self.replica.verify_promotion_rpc(
+                sender,
+                u8::from(pre_vote),
+                &store::encode(&request)?,
+                source.ok_or(invalid("missing effective promotion"))?,
+            )?;
+            let tip = request
+                .last_log_id
+                .ok_or(invalid("missing candidate log tip"))?;
+            if tip.index < k.index
+                || (tip.index == k.index && tip != k)
+                || tip.leader_id.term < k.leader_id.term
+                || request.vote.leader_id.term <= tip.leader_id.term
+            {
+                return Err(invalid("candidate log does not cover promotion"));
+            }
+        } else if !voters.contains(&self.local) {
             self.replica.verify_candidate_join(
                 &request,
                 pre_vote,
@@ -159,7 +177,61 @@ impl LearnerReplication {
         authenticated_sender: ReplicaId,
         request: openraft::raft::AppendEntriesRequest<Types>,
     ) -> io::Result<openraft::raft::AppendResult<Types>> {
+        self.append_entries_with_join_source(authenticated_sender, request, None)
+            .await
+    }
+    pub async fn append_entries_with_join_source(
+        &self,
+        authenticated_sender: ReplicaId,
+        request: openraft::raft::AppendEntriesRequest<Types>,
+        source: Option<&[u8]>,
+    ) -> io::Result<openraft::raft::AppendResult<Types>> {
         let route = { third::local_route(&self.replica, &*self.replica.lock()?)? };
+        let voters: Vec<_> = self.raft.voter_ids().collect();
+        let eligible_sender = if voters.len() == 3 {
+            voters.contains(&authenticated_sender) && self.local != authenticated_sender
+        } else {
+            authenticated_sender == self.creator
+                || route
+                    .as_ref()
+                    .is_some_and(|r| r.joined == authenticated_sender)
+        };
+        if self.local == authenticated_sender
+            || request.vote.leader_id.node_id != authenticated_sender
+        {
+            return Err(invalid("replication sender outside authorized membership"));
+        }
+        if !eligible_sender {
+            let k = self.replica.verify_promotion_rpc(
+                authenticated_sender,
+                2,
+                &store::encode(&request)?,
+                source.ok_or(invalid("missing effective promotion"))?,
+            )?;
+            if request.vote.leader_id.term <= k.leader_id.term {
+                return Err(invalid("replication term predates promotion"));
+            }
+        }
+        let third = store::meta::<JoinedMember>(&*self.replica.lock()?, "third_member")?;
+        for entry in &request.entries {
+            if third
+                .as_ref()
+                .is_some_and(|m| entry.log_id.index >= m.log_id.index)
+                && entry
+                    .payload
+                    .check_members()?
+                    .is_some_and(|m| m.voter_ids().count() != 3)
+            {
+                return Err(invalid("unexpected change after third Join"));
+            }
+            if entry
+                .payload
+                .check_members()?
+                .is_some_and(|m| m.voter_ids().count() == 3)
+            {
+                self.replica.verify_third_entry(entry)?;
+            }
+        }
         if let Some(route) = route {
             route.check_replication(self.creator, authenticated_sender, &request)?;
             return self
@@ -168,10 +240,14 @@ impl LearnerReplication {
                 .await
                 .map_err(io::Error::other);
         }
-        if authenticated_sender != self.creator || request.vote.leader_id.node_id != self.creator {
-            return Err(invalid("replication sender differs from pinned creator"));
-        }
         for entry in &request.entries {
+            if entry
+                .payload
+                .check_members()?
+                .is_some_and(|m| m.voter_ids().count() == 3)
+            {
+                continue;
+            }
             if let Some(raw) = entry.payload.join_command()? {
                 self.replica.verify_local_promotion(raw, &entry.payload)?;
                 continue;

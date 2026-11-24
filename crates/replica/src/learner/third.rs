@@ -14,10 +14,10 @@ const ROUTE: &[u8] = b"RatRaceSync/learner/two-voter-route/v1";
 pub(crate) struct RecoveryRoute {
     learner: ReplicaId,
     learner_key: [u8; 32],
-    admission: Vec<u8>,
-    joined: ReplicaId,
-    joined_key: [u8; 32],
-    pub(super) join: LogId,
+    pub(super) admission: Vec<u8>,
+    pub(super) joined: ReplicaId,
+    pub(super) joined_key: [u8; 32],
+    pub(crate) join: LogId,
     certificate: Vec<u8>,
 }
 
@@ -36,7 +36,10 @@ fn member(db: &Connection) -> io::Result<JoinedMember> {
 
 fn require_open_place(db: &Connection) -> io::Result<()> {
     let lobby = join::created(db)?;
-    if lobby.stage != LobbyStage::Open as i32 || lobby.target <= 2 {
+    if lobby.stage != LobbyStage::Open as i32
+        || lobby.target <= 2
+        || store::meta::<JoinedMember>(db, "third_member")?.is_some()
+    {
         return Err(invalid("no open place for an additional player"));
     }
     Ok(())
@@ -49,7 +52,7 @@ fn support(raw: &[u8]) -> Vec<u8> {
 }
 
 impl RecoveryRoute {
-    fn parse(r: &Replica, creator: &Creator, raw: &[u8]) -> io::Result<Self> {
+    pub(super) fn parse(r: &Replica, creator: &Creator, raw: &[u8]) -> io::Result<Self> {
         if raw.len() > 32768 {
             return Err(invalid("oversized recovery route"));
         }
@@ -77,7 +80,7 @@ impl RecoveryRoute {
             certificate: f[&6].to_vec(),
         })
     }
-    fn check_member(&self, db: &Connection) -> io::Result<()> {
+    pub(super) fn check_member(&self, db: &Connection) -> io::Result<()> {
         let m = member(db)?;
         let signed = fields(&self.admission, &[1, 2])?;
         let learner = fields(signed[&1], &[1, 2, 3, 4, 5, 6])?;
@@ -125,6 +128,13 @@ impl RecoveryRoute {
                 };
                 e.payload.join_command()?.is_none()
                     && m == Members::new_with_defaults(vec![[creator].into()], learners)
+            } else if m.voter_ids().count() == 3 {
+                // The receiver verifies the complete signed promotion before this check.
+                e.payload.join_command()?.is_some()
+                    && m == Members::new_with_defaults(
+                        vec![[creator, self.joined, self.learner].into()],
+                        [],
+                    )
             } else {
                 e.payload.join_command()?.is_none()
                     && registration(&m, creator, self.joined)
@@ -186,10 +196,17 @@ impl GameNode {
         mut peer: impl AsyncFnMut(VotingHistoryRequest) -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
         let r = &self.replica;
-        let (join, high) = {
+        let (join, high, promoted) = {
             let db = r.lock()?;
-            (member(&db)?.log_id, history::boundary(&db)?)
+            (
+                member(&db)?.log_id,
+                history::boundary(&db)?,
+                store::meta::<JoinedMember>(&db, "third_member")?.is_some(),
+            )
         };
+        if promoted {
+            return self.reconcile_voting_history(high, key, peer).await;
+        }
         if !self.voting_history_complete(join)? {
             return Err(invalid("original Join history handoff incomplete"));
         }

@@ -1,6 +1,11 @@
-//! Direct transition from the creator and one verified learner to two voters.
+//! Direct, source-bearing promotion of verified lobby learners.
 use super::*;
+mod authority;
+pub use authority::PromotionAuthority;
+mod delivery;
+pub use delivery::ThirdJoinTransport;
 mod election;
+pub(super) mod promotion;
 use crate::{
     application::ReceiptRecord,
     lobby::{frame, persist_link},
@@ -36,6 +41,7 @@ pub struct JoinDelivery {
 }
 
 struct Intent<'a> {
+    approvals: Option<[&'a [u8]; 2]>,
     actor: &'a [u8],
     key: [u8; 32],
     node: ReplicaId,
@@ -52,7 +58,7 @@ fn parse<'a>(r: &Replica, raw: &'a [u8]) -> io::Result<Intent<'a>> {
     if raw.len() > 16384 {
         return Err(invalid("oversized Join"));
     }
-    let outer = fields(raw, &[1, 2])?;
+    let outer = fields(raw, &[1, 2]).or_else(|_| fields(raw, &[1, 2, 3, 4]))?;
     let envelope = fields(outer[&1], &[1, 2])?;
     let body = fields(envelope[&1], &[1, 2, 3, 4, 5, 12])?;
     let action = fields(fields(body[&12], &[202])?[&202], &[1, 2])?;
@@ -110,6 +116,7 @@ fn parse<'a>(r: &Replica, raw: &'a [u8]) -> io::Result<Intent<'a>> {
         return Err(invalid("invalid verified Join prefix witness"));
     }
     Ok(Intent {
+        approvals: outer.get(&3).map(|a| [*a, outer[&4]]),
         actor,
         key,
         node,
@@ -165,6 +172,17 @@ impl InstallationCatalog {
     ) -> io::Result<JoinDelivery> {
         let raw = self.prepare_join(learner, key, request, profile_complete)?;
         let reported = submit(raw.clone()).await?;
+        self.finish_join(learner, key, &raw, reported, exchange)
+            .await
+    }
+    async fn finish_join(
+        &self,
+        learner: &Learner,
+        key: &SigningKey,
+        raw: &[u8],
+        reported: JoinResult,
+        exchange: impl AsyncFnMut(VotingHistoryRequest) -> io::Result<Vec<u8>>,
+    ) -> io::Result<JoinDelivery> {
         learner
             .node
             .raft
@@ -173,7 +191,7 @@ impl InstallationCatalog {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::TimedOut, e))?;
         let node = learner.joined_node()?;
-        let original = original_join(&*node.replica.lock()?, &parse(&node.replica, &raw)?)?
+        let original = original_join(&*node.replica.lock()?, &parse(&node.replica, raw)?)?
             .ok_or(invalid("missing local Join receipt"))?;
         if original != reported {
             return Err(invalid(
@@ -197,13 +215,23 @@ impl InstallationCatalog {
         request: [u8; 16],
         profile_complete: bool,
     ) -> io::Result<Vec<u8>> {
+        self.prepare_intent(learner, key, request, profile_complete, false)
+    }
+    fn prepare_intent(
+        &self,
+        learner: &Learner,
+        key: &SigningKey,
+        request: [u8; 16],
+        profile_complete: bool,
+        third_player: bool,
+    ) -> io::Result<Vec<u8>> {
         let verified = self.verified_join_prefix(learner)?;
         let admission = learner.admission(key)?;
         let r = &learner.node.replica;
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
-        if third::local_route(r, &tx)?.is_some() {
-            return Err(invalid("recovery learner is outside the first-player Join"));
+        if third::local_route(r, &tx)?.is_some() != third_player {
+            return Err(invalid("incorrect admission for this Join"));
         }
         let saved = store::meta::<Vec<u8>>(&tx, "local_join")?;
         if let Some(raw) = &saved {
@@ -211,7 +239,16 @@ impl InstallationCatalog {
             if original.request != request {
                 return Err(invalid("another Join owns this reservation"));
             }
-            if store::meta::<JoinedMember>(&tx, "first_member")?.is_some() {
+            if store::meta::<JoinedMember>(
+                &tx,
+                if third_player {
+                    "third_member"
+                } else {
+                    "first_member"
+                },
+            )?
+            .is_some()
+            {
                 return Ok(raw.clone());
             }
         } else if !profile_complete {
@@ -223,7 +260,9 @@ impl InstallationCatalog {
         let lobby = created(&tx)?;
         let m = history::membership(&tx)?;
         let membership = log_key(m.log_id().ok_or(invalid("missing membership source"))?);
-        let setup = lobby.setup_revision.to_be_bytes();
+        let setup = store::meta::<JoinedMember>(&tx, "first_member")?
+            .map_or(lobby.setup_revision, |m| m.setup_revision)
+            .to_be_bytes();
         let layout = lobby.layout_revision.to_be_bytes();
         let guard = message(&[(1, &setup), (2, &layout), (3, &membership)]);
         let leaf = message(&[(1, &learner.id.0), (2, &admission)]);
@@ -278,8 +317,18 @@ impl InstallationCatalog {
     pub fn pending_join(&self, learner: &Learner) -> io::Result<Vec<u8>> {
         self.verified_join_prefix(learner)?;
         let db = learner.node.replica.lock()?;
-        let raw = store::meta::<Vec<u8>>(&db, "local_join")?.ok_or(invalid("no pending Join"))?;
-        parse(&learner.node.replica, &raw)?;
+        let third = third::local_route(&learner.node.replica, &db)?.is_some();
+        let raw = store::meta::<Vec<u8>>(
+            &db,
+            if third {
+                "third_proposal"
+            } else {
+                "local_join"
+            },
+        )?
+        .ok_or(invalid("no pending Join"))?;
+        let intent = parse(&learner.node.replica, &raw)?;
+        intent.verify_approvals(&db, &learner.creator, if third { 3 } else { 2 })?;
         Ok(raw)
     }
 }
@@ -289,29 +338,64 @@ pub(super) fn target(creator: ReplicaId, peer: ReplicaId) -> Members {
 }
 
 impl Intent<'_> {
-    fn validate(&self, db: &Connection, creator: &Creator) -> io::Result<LogId> {
+    fn validate(&self, db: &Connection, creator: &Creator) -> io::Result<Transition> {
         let prev = history::membership(db)?;
         let prior = prev
             .log_id()
             .ok_or(invalid("missing committed membership"))?;
         let lobby = created(db)?;
+        let first = store::meta::<JoinedMember>(db, "first_member")?;
+        let (prior_voters, target, revision, ordinal, slot) = if let Some(member) = first {
+            if self.actor == member.actor
+                || self.key == member.key
+                || self.node == member.node
+                || store::meta::<JoinedMember>(db, "third_member")?.is_some()
+            {
+                return Err(invalid("occupied third player identity or slot"));
+            }
+            (
+                target(creator.node, member.node),
+                promotion::roster(creator.node, member.node, self.node),
+                member.setup_revision,
+                3,
+                "third_member",
+            )
+        } else {
+            (
+                Members::new_with_defaults(vec![[creator.node].into()], []),
+                target(creator.node, self.node),
+                lobby.setup_revision,
+                2,
+                "first_member",
+            )
+        };
         if prev.membership().get_joint_config().len() != 1
-            || !prev.membership().voter_ids().eq([creator.node])
+            || prev.membership().get_joint_config() != prior_voters.get_joint_config()
             || !prev.membership().non_write_voter_ids().eq([self.node])
             || self.actor == creator.actor
             || self.key == creator.key
             || self.node == creator.node
             || self.membership != log_key(prior)
-            || self.setup != lobby.setup_revision
+            || self.setup != revision
             || self.layout != lobby.layout_revision
-            || lobby.target < 2
+            || lobby.target < ordinal
             || lobby.stage != LobbyStage::Open as i32
-            || store::meta::<JoinedMember>(db, "first_member")?.is_some()
         {
-            return Err(invalid("stale or ineligible first Join"));
+            return Err(invalid("stale or ineligible Join"));
         }
-        Ok(prior)
+        Ok(Transition {
+            prior,
+            target,
+            ordinal,
+            slot,
+        })
     }
+}
+struct Transition {
+    prior: LogId,
+    target: Members,
+    ordinal: u32,
+    slot: &'static str,
 }
 
 impl GameNode {
@@ -332,17 +416,25 @@ impl GameNode {
             }
             let creator =
                 store::meta::<Creator>(&db, "creator")?.ok_or(invalid("missing creator"))?;
-            let prior = intent.validate(&db, &creator)?;
+            let change = intent.validate(&db, &creator)?;
+            intent.verify_approvals(&db, &creator, change.ordinal)?;
             let high = history::boundary(&db)?;
-            if r.local_node != Some(creator.node)
-                || store::meta::<Vec<u8>>(&db, "learner_admission")?.as_deref()
-                    != Some(intent.admission)
+            if change.ordinal == 3 && intent.prefix != log_key(high) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "refresh verified learner prefix",
+                ));
+            }
+            if (change.ordinal == 2
+                && (r.local_node != Some(creator.node)
+                    || store::meta::<Vec<u8>>(&db, "learner_admission")?.as_deref()
+                        != Some(intent.admission)))
                 || intent.prefix != log_key(high)
                 || intent.sealed != sealed_range(r, &db, &creator.key, high)?
             {
                 return Err(invalid("Join lacks matching verified prefix and admission"));
             }
-            (high, prior, target(creator.node, intent.node))
+            (high, change.prior, change.target)
         };
         let response = self
             .raft
@@ -388,13 +480,22 @@ fn original_join(db: &Connection, intent: &Intent<'_>) -> io::Result<Option<Join
     if fp != intent.fingerprint {
         return Err(invalid("Join request ID conflict"));
     }
-    let member =
-        store::meta::<JoinedMember>(db, "first_member")?.ok_or(invalid("missing joined member"))?;
+    let member = member_for(db, intent.node)?.ok_or(invalid("missing joined member"))?;
     Ok(Some(JoinResult {
         log_id: member.log_id,
         member,
         receipt,
     }))
+}
+pub(super) fn member_for(db: &Connection, node: ReplicaId) -> io::Result<Option<JoinedMember>> {
+    for slot in ["first_member", "third_member"] {
+        if let Some(m) = store::meta::<JoinedMember>(db, slot)?
+            && m.node == node
+        {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
 }
 
 impl Replica {
@@ -473,10 +574,13 @@ impl Replica {
     ) -> io::Result<Vec<u8>> {
         let command = parse(self, raw)?;
         let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-        let prior = command.validate(db, &creator)?;
+        let change = command.validate(db, &creator)?;
+        command.verify_approvals(db, &creator, change.ordinal)?;
+        let prior = change.prior;
         let prev = store::meta::<LogId>(db, "applied")?.ok_or(invalid("no verified prefix"))?;
-        if command.prefix != log_key(prev)
-            || m != &target(creator.node, command.node)
+        if k.leader_id != prev.leader_id
+            || command.prefix != log_key(prev)
+            || m != &change.target
             || original_join(db, &command)?.is_some()
         {
             return Err(invalid("invalid committed Join transition"));
@@ -485,7 +589,7 @@ impl Replica {
             actor: command.actor.into(),
             key: command.key,
             node: command.node,
-            ordinal: 2,
+            ordinal: change.ordinal,
             setup_revision: command
                 .setup
                 .checked_add(1)
@@ -517,10 +621,11 @@ impl Replica {
         ]);
         let (events, prev_event) = self.tip(db, "event")?;
         let (receipts, prev_receipt) = self.tip(db, "receipt")?;
-        if (events, receipts) != (1, 1) {
-            return Err(invalid("unexpected history before first Join"));
+        let sequence = i64::from(change.ordinal);
+        if (events, receipts) != (sequence - 1, sequence - 1) {
+            return Err(invalid("unexpected history before Join"));
         }
-        let seq = 2i64.to_be_bytes();
+        let seq = sequence.to_be_bytes();
         let id = wire::hash(b"event-id", &[&self.session, &kbytes, &seq]);
         let mut facts = vec![
             self.profile(),
@@ -554,7 +659,7 @@ impl Replica {
         let et = persist_link(
             db,
             "event",
-            2,
+            sequence,
             b"event-step/v2",
             &prev_event,
             &frame(&[b"MemberJoined/v1", &semantic]),
@@ -562,7 +667,7 @@ impl Replica {
         let rt = persist_link(
             db,
             "receipt",
-            2,
+            sequence,
             b"receipt-step/v2",
             &prev_receipt,
             &frame(&[b"JoinReceipt/v1", &12u16.to_be_bytes(), &semantic]),
@@ -583,20 +688,27 @@ impl Replica {
             request: &command.request,
             fingerprint: &command.fingerprint,
             log: &kbytes,
-            seq: 2,
+            seq: sequence,
             outcome: &result,
             refs: &id,
             source_digest: digest,
         }
         .record();
         db.execute(
-            "INSERT INTO event(seq,actor,record,digest,tip) VALUES(2,?,?,?,?)",
-            params![command.actor, event, Sha256::digest(&event).as_slice(), et],
+            "INSERT INTO event(seq,actor,record,digest,tip) VALUES(?,?,?,?,?)",
+            params![
+                sequence,
+                command.actor,
+                event,
+                Sha256::digest(&event).as_slice(),
+                et
+            ],
         )
         .map_err(io::Error::other)?;
         db.execute(
-            "INSERT INTO receipt VALUES(2,?,?,?,?,?)",
+            "INSERT INTO receipt VALUES(?,?,?,?,?,?)",
             params![
+                sequence,
                 command.actor,
                 command.request,
                 command.fingerprint,
@@ -605,7 +717,7 @@ impl Replica {
             ],
         )
         .map_err(io::Error::other)?;
-        store::put(db, "first_member", &member)?;
+        store::put(db, change.slot, &member)?;
         Ok(receipt)
     }
 }

@@ -10,12 +10,15 @@ use openraft::{
 use std::{collections::BTreeMap, future::Future, time::Duration};
 use tokio::time::{sleep, timeout};
 
+type AuthorityMap = Arc<Mutex<BTreeMap<ReplicaId, (PromotionAuthority, SigningKey)>>>;
 #[derive(Clone, Default)]
 struct Bus(
     Arc<Mutex<BTreeMap<ReplicaId, Raft>>>,
     Arc<Mutex<BTreeMap<ReplicaId, (ReplicaId, LearnerReplication)>>>,
     Arc<Mutex<Option<std::sync::Weak<GameNode>>>>,
     Arc<std::sync::atomic::AtomicBool>,
+    Arc<Mutex<Vec<ReplicaId>>>,
+    AuthorityMap,
 );
 struct Peer {
     bus: Bus,
@@ -36,11 +39,20 @@ impl Peer {
             .unwrap()
             .as_ref()
             .and_then(|weak| weak.upgrade());
-        let source = host
-            .map(|node| node.pending_join_election_source(&r, pre, &key()))
+        let authority = self.bus.5.lock().unwrap().get(&sender).cloned();
+        let proof = authority
+            .map(|(a, k)| a.election(&r, pre, &k))
             .transpose()
             .map_err(|e| Unreachable::new(&e))?
             .flatten();
+        let source = if proof.is_some() {
+            proof
+        } else {
+            host.map(|node| node.pending_join_election_source(&r, pre, &key()))
+                .transpose()
+                .map_err(|e| Unreachable::new(&e))?
+                .flatten()
+        };
         peer.vote_with_join_source(sender, r, pre, source.as_deref())
             .await
             .map_err(|e| Unreachable::new(&e).into())
@@ -73,11 +85,29 @@ impl RaftNetworkV2<Types> for Peer {
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
         let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
         if let Some((sender, peer)) = learner {
+            if self.bus.4.lock().unwrap().contains(&self.id)
+                && r.entries.iter().any(|entry| {
+                    entry
+                        .payload
+                        .check_members()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.voter_ids().count() == 3)
+                })
+            {
+                return Err(Unreachable::from_string("promotion not replicated").into());
+            }
             if self.bus.3.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(Unreachable::from_string("replication interrupted").into());
             }
+            let authority = self.bus.5.lock().unwrap().get(&sender).cloned();
+            let source = authority
+                .map(|(a, k)| a.replication(&r, &k))
+                .transpose()
+                .map_err(|e| Unreachable::new(&e))?
+                .flatten();
             return peer
-                .append_entries(sender, r)
+                .append_entries_with_join_source(sender, r, source.as_deref())
                 .await
                 .map_err(|e| Unreachable::new(&e).into());
         }

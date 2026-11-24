@@ -4,7 +4,8 @@ mod catalog;
 mod genesis;
 mod learner;
 pub use learner::{
-    JoinDelivery, JoinResult, JoinedMember, Learner, LearnerReplication, VotingHistoryRequest,
+    JoinDelivery, JoinResult, JoinedMember, Learner, LearnerReplication, PromotionAuthority,
+    ThirdJoinTransport, VotingHistoryRequest,
 };
 mod lobby;
 pub use catalog::{CreatorGame, InstallationCatalog};

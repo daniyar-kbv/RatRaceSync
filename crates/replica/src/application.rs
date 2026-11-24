@@ -346,13 +346,18 @@ impl Replica {
             self.verify_replay(&tx)?;
             if let Some(raw) = e.payload.join_command()? {
                 recovery_route = learner::third::local_route(self, &tx)?;
-                if recovery_route.is_none() {
+                if !recovery_route
+                    .as_ref()
+                    .is_some_and(|route| route.join == e.log_id)
+                {
                     self.verify_join_coverage(&tx, raw)?;
                 }
             }
         }
         let reply = self.apply_in_transaction(&tx, &e)?;
-        if let Some(route) = recovery_route {
+        if let Some(route) = recovery_route
+            && route.join == e.log_id
+        {
             // Historical replay at a third installation. The original certificate
             // binds this exact applied row before commit. Staging later checks
             // the Join's signed predecessor range before advancing its cursor.

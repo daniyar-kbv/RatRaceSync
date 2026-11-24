@@ -40,6 +40,7 @@ impl GameNode {
         }
         {
             let db = replica.lock()?;
+            replica.verify_pending_lobby_membership(&db)?;
             match store::meta::<ReplicaId>(&db, "local_node")? {
                 Some(saved) if saved != id => {
                     return Err(invalid("database belongs to another replica"));

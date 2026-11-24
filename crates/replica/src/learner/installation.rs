@@ -4,7 +4,7 @@ use openraft::{
     network::{NetSnapshot, RaftNetworkFactory},
 };
 
-struct Reservation {
+pub(super) struct Reservation {
     id: ReplicaId,
     session: Vec<u8>,
     invitation: Vec<u8>,
@@ -92,7 +92,7 @@ impl InstallationCatalog {
         let (_, pin) = invitation(&state.session, &state.invitation)?;
         Ok(state.verified.map(|_| pin.fingerprint))
     }
-    fn reserved_learner(&self, learner: &Learner) -> io::Result<Reservation> {
+    pub(super) fn reserved_learner(&self, learner: &Learner) -> io::Result<Reservation> {
         let state = read(&self.db)?;
         let (_, pin) = invitation(&state.session, &state.invitation)?;
         if !state.prepared

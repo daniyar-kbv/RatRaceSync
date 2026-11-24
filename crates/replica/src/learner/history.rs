@@ -31,7 +31,13 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                 .ok_or(invalid("invalid historical membership"))?;
             let creator =
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-            let valid = if let Some(member) = joined_at(db, entry.log_id.index)? {
+            let valid = if let Some(third) = third_at(db, entry.log_id.index)? {
+                let first = joined_at(db, entry.log_id.index)?
+                    .ok_or(invalid("missing predecessor voter"))?;
+                entry.log_id == third.log_id
+                    && members == join::promotion::roster(creator.node, first.node, third.node)
+                    && entry.payload.join_command()?.is_some()
+            } else if let Some(member) = joined_at(db, entry.log_id.index)? {
                 (entry.log_id == member.log_id
                     && members == join::target(creator.node, member.node)
                     && entry.payload.join_command()?.is_some())
@@ -93,7 +99,7 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
     let creator =
         store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing signer binding"))?;
     let binding = if let Some(member) = joined_at(db, index)? {
-        let mut bindings = [
+        let mut bindings = vec![
             (
                 creator.node,
                 binding(&creator.actor, &creator.key, creator.node),
@@ -103,8 +109,17 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
                 binding(&member.actor, &member.key, member.node),
             ),
         ];
+        if let Some(third) = third_at(db, index)? {
+            bindings.push((third.node, binding(&third.actor, &third.key, third.node)));
+        }
         bindings.sort_by_key(|x| x.0);
-        message(&[(1, &bindings[0].1), (2, &bindings[1].1)])
+        message(
+            &bindings
+                .iter()
+                .enumerate()
+                .map(|(i, (_, b))| ((i + 1) as u32, b.as_slice()))
+                .collect::<Vec<_>>(),
+        )
     } else {
         binding(&creator.actor, &creator.key, creator.node)
     };
@@ -132,6 +147,9 @@ fn binding(actor: &[u8], key: &[u8; 32], node: ReplicaId) -> Vec<u8> {
 }
 pub(super) fn joined_at(db: &Connection, index: u64) -> io::Result<Option<JoinedMember>> {
     Ok(store::meta::<JoinedMember>(db, "first_member")?.filter(|m| m.log_id.index <= index))
+}
+pub(super) fn third_at(db: &Connection, index: u64) -> io::Result<Option<JoinedMember>> {
+    Ok(store::meta::<JoinedMember>(db, "third_member")?.filter(|m| m.log_id.index <= index))
 }
 pub(super) fn signer_record(
     r: &Replica,
@@ -185,7 +203,7 @@ pub(super) fn archive_piece(db: &Connection, index: u64) -> io::Result<Vec<u8>> 
             wire::field(&mut out, tag, &[]);
             continue;
         }
-        if previous.checked_add(1) != Some(count) || !(1..=2).contains(&count) {
+        if previous.checked_add(1) != Some(count) || !(1..=3).contains(&count) {
             return Err(invalid("unsupported lobby archive delta"));
         }
         let sql = format!(
