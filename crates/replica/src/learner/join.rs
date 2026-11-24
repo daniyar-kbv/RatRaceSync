@@ -11,7 +11,6 @@ use crate::{
     lobby::{frame, persist_link},
 };
 use openraft::{entry::RaftPayload, raft::Precondition};
-use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const WITNESS: &[u8] = b"RatRaceSync/verified-join-prefix/v1";
@@ -155,10 +154,6 @@ pub(super) fn sealed_range(
     }
     Ok(sha.finalize().into())
 }
-pub(super) fn created(db: &Connection) -> io::Result<LobbyCreated> {
-    let bytes = store::meta::<Vec<u8>>(db, "lobby")?.ok_or(invalid("missing open lobby"))?;
-    LobbyCreated::decode(&*bytes).map_err(io::Error::other)
-}
 impl InstallationCatalog {
     /// Normal adapter entry point for the first additional player. Both
     /// exchanges use already authenticated peer transports. Repeating this
@@ -259,7 +254,7 @@ impl InstallationCatalog {
         if history::boundary(&tx)? != verified {
             return Err(invalid("refresh verified learner prefix"));
         }
-        let lobby = created(&tx)?;
+        let lobby = seating::layout_at(&tx, u64::MAX)?;
         let m = history::membership(&tx)?;
         let membership = log_key(m.log_id().ok_or(invalid("missing membership source"))?);
         let setup = seating::setup_revision(&tx)?.to_be_bytes();
@@ -343,7 +338,7 @@ impl Intent<'_> {
         let prior = prev
             .log_id()
             .ok_or(invalid("missing committed membership"))?;
-        let lobby = created(db)?;
+        let lobby = seating::layout_at(db, u64::MAX)?;
         let first = store::meta::<JoinedMember>(db, "first_member")?;
         let (prior_voters, target, ordinal, slot) = if let Some(member) = first {
             if self.actor == member.actor
@@ -376,8 +371,7 @@ impl Intent<'_> {
             || self.membership != log_key(prior)
             || self.setup != seating::setup_revision(db)?
             || self.layout != lobby.layout_revision
-            || lobby.target < ordinal
-            || lobby.stage != LobbyStage::Open as i32
+            || u32::from(lobby.seats.capacity().count()) < ordinal
         {
             return Err(invalid("stale or ineligible Join"));
         }
@@ -730,7 +724,7 @@ impl Replica {
         .map_err(io::Error::other)?;
         store::put(db, change.slot, &member)?;
         if self.seating_enabled() {
-            store::put(db, "setup_revision", &member.setup_revision)?;
+            self.advance_setup(db, k.index, member.setup_revision)?;
         }
         Ok(receipt)
     }

@@ -16,6 +16,7 @@ pub(crate) enum LobbyFormat {
     SemanticLinks,
     Seating,
     SeatChanges,
+    Resizable,
 }
 
 impl LobbyFormat {
@@ -23,12 +24,16 @@ impl LobbyFormat {
         self != Self::Legacy
     }
     pub(crate) fn seating(self) -> bool {
-        matches!(self, Self::Seating | Self::SeatChanges)
+        matches!(self, Self::Seating | Self::SeatChanges | Self::Resizable)
+    }
+    pub(crate) fn seat_history(self) -> bool {
+        matches!(self, Self::SeatChanges | Self::Resizable)
     }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::Resizable => b"RatRaceSync/Classic101/lobby/v5",
             Self::SeatChanges => b"RatRaceSync/Classic101/lobby/v4",
             Self::Seating => b"RatRaceSync/Classic101/lobby/v3",
         }
@@ -39,6 +44,7 @@ impl LobbyFormat {
             Self::SemanticLinks,
             Self::Seating,
             Self::SeatChanges,
+            Self::Resizable,
         ]
         .into_iter()
         .find(|f| f.profile() == bytes)
@@ -392,7 +398,10 @@ impl Replica {
                 let (record, tip) = receipt.encode(&prev_receipt, &result_digest);
                 (record, tip, legacy_event_tip)
             }
-            LobbyFormat::SemanticLinks | LobbyFormat::Seating | LobbyFormat::SeatChanges => {
+            LobbyFormat::SemanticLinks
+            | LobbyFormat::Seating
+            | LobbyFormat::SeatChanges
+            | LobbyFormat::Resizable => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();

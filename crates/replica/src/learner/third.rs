@@ -35,9 +35,8 @@ fn member(db: &Connection) -> io::Result<JoinedMember> {
 }
 
 fn require_open_place(db: &Connection) -> io::Result<()> {
-    let lobby = join::created(db)?;
-    if lobby.stage != LobbyStage::Open as i32
-        || lobby.target <= 2
+    let lobby = seating::layout_at(db, u64::MAX)?;
+    if lobby.seats.capacity().count() <= 2
         || store::meta::<JoinedMember>(db, "third_member")?.is_some()
     {
         return Err(invalid("no open place for an additional player"));

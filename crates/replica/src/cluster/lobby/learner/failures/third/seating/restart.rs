@@ -7,7 +7,9 @@ async fn claim_crash_worker() {
     };
     let stage: u8 = std::env::var("SEAT_TEST_STAGE").unwrap().parse().unwrap();
     let op: u16 = std::env::var("SEAT_TEST_OP").unwrap().parse().unwrap();
-    let format = if op == 204 {
+    let format = if op == 203 {
+        crate::lobby::LobbyFormat::Resizable
+    } else if op == 204 {
         crate::lobby::LobbyFormat::Seating
     } else {
         crate::lobby::LobbyFormat::SeatChanges
@@ -23,6 +25,10 @@ async fn claim_crash_worker() {
     } else {
         host.submit(guard.sign(request(29), &key())).await.unwrap();
         match op {
+            203 => host
+                .player_count_guard(ACTOR, rat_race_engine::LobbyCapacity::new(2).unwrap())
+                .await
+                .unwrap(),
             205 => host.seat_release_guard(ACTOR).await.unwrap(),
             206 => host
                 .seat_change_guard(ACTOR, SeatId::new(3).unwrap())
@@ -34,24 +40,49 @@ async fn claim_crash_worker() {
     let raw = host
         .prepare_seat_command(&guard, request(30), &key())
         .unwrap();
+    let conflict = std::env::var("RESIZE_CONFLICT").as_deref() == Ok("true");
+    if conflict {
+        assert!(host.replica.preflight(&raw).unwrap().is_none());
+        let claim = host
+            .seat_claim_guard(b"guest", SeatId::new(3).unwrap())
+            .await
+            .unwrap();
+        host.submit(claim.sign(request(31), &p.identity))
+            .await
+            .unwrap();
+    }
     host.replica
         .crash
         .store(stage, std::sync::atomic::Ordering::Release);
-    host.submit(raw).await.unwrap();
+    if conflict {
+        host.raft.client_write(raw).await.unwrap();
+    } else {
+        host.submit(raw).await.unwrap();
+    }
     panic!("SQLite crash boundary not reached")
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_original_claim_reopens_on_both_sides_of_sql_commit() {
-    check_restart(204).await;
+    check_restart(204, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_seat_changes_reopen_atomically_on_both_sides_of_sql_commit() {
     for op in [205, 206] {
-        check_restart(op).await;
+        check_restart(op, false).await;
     }
 }
-async fn check_restart(op: u16) {
-    let seq = if op == 204 { 3 } else { 4 };
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_recovers_original_command_and_receipt_across_sql_commit() {
+    for conflict in [false, true] {
+        check_restart(203, conflict).await;
+    }
+}
+async fn check_restart(op: u16, conflict: bool) {
+    let seq = if op == 204 {
+        3
+    } else {
+        4 + i64::from(conflict)
+    };
     for stage in [1, 2] {
         let dir = tempfile::tempdir().unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
@@ -61,6 +92,7 @@ async fn check_restart(op: u16) {
             ])
             .env("SEAT_TEST_ROOT", dir.path())
             .env("SEAT_TEST_OP", op.to_string())
+            .env("RESIZE_CONFLICT", conflict.to_string())
             .env("SEAT_TEST_STAGE", stage.to_string())
             .status()
             .unwrap();
@@ -87,7 +119,7 @@ async fn check_restart(op: u16) {
                 .optional()
                 .unwrap();
             assert_eq!(receipt.is_some(), stage == 2);
-            if op != 204 {
+            if matches!(op, 205 | 206) {
                 let changed: i64 = db
                     .query_row(
                         "SELECT count(*) FROM seat_history WHERE revision<>? OR seat=3",
@@ -105,6 +137,12 @@ async fn check_restart(op: u16) {
                         2
                     }
                 );
+            }
+            if op == 203 {
+                let layouts: i64 = db
+                    .query_row("SELECT count(*) FROM layout_history", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(layouts, i64::from(stage == 2 && !conflict));
             }
             let bytes: Vec<u8> = db
                 .query_row(
@@ -150,6 +188,10 @@ async fn check_restart(op: u16) {
         .unwrap();
         let rf = fields(&out, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
         assert_eq!(rf[&5], log_key(original.0.log_id));
+        if conflict {
+            assert_eq!(fields(rf[&7], &[13]).unwrap()[&13], [8, 1]);
+            assert!(rf[&8].is_empty());
+        }
         if let Some(prior) = original.1 {
             assert_eq!(out, prior)
         }
@@ -161,7 +203,7 @@ async fn check_restart(op: u16) {
                 .unwrap();
             let db = node.replica.lock().unwrap();
             node.replica.verify_replay(&db).unwrap();
-            if op != 204 {
+            if matches!(op, 205 | 206) {
                 let rows: Vec<(i64, Option<Vec<u8>>)> = db
                     .prepare("SELECT seat,occupant FROM seat_history WHERE idx=? ORDER BY seat")
                     .unwrap()
@@ -177,7 +219,21 @@ async fn check_restart(op: u16) {
                 }
                 assert_eq!(rows, expected);
             }
-            assert_eq!(node.replica.tip(&db, "event").unwrap().0, seq);
+            if op == 203 {
+                let state = crate::seating::layout_at(&db, u64::MAX).unwrap();
+                assert_eq!(
+                    (state.seats.capacity().count(), state.layout_revision),
+                    if conflict { (3, 1) } else { (2, 2) }
+                );
+                assert_eq!(
+                    crate::seating::setup_revision(&db).unwrap(),
+                    3 + u64::from(conflict)
+                );
+            }
+            assert_eq!(
+                node.replica.tip(&db, "event").unwrap().0,
+                seq - i64::from(conflict)
+            );
             assert_eq!(node.replica.tip(&db, "receipt").unwrap().0, seq);
         }
         p.shutdown().await.unwrap();

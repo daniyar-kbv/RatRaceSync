@@ -24,6 +24,11 @@ async fn only_a_genuinely_eligible_historical_claim_can_receive_a_conflict() {
     assert_ne!(valid.0, claim.0);
     let original = host.submit(valid.clone()).await.unwrap();
     assert_eq!(host.submit(claim.clone()).await.unwrap(), original);
+    assert!(
+        host.player_count_guard(ACTOR, rat_race_engine::LobbyCapacity::new(3).unwrap())
+            .await
+            .is_err()
+    );
     assert!(host.seat_release_guard(ACTOR).await.is_err());
     assert!(
         host.seat_change_guard(ACTOR, SeatId::new(2).unwrap())
@@ -241,5 +246,77 @@ async fn failed_destination_write_rolls_back_source_and_replay_detects_changed_h
     }
     assert_eq!(before, host.lobby_seating(ACTOR).await.unwrap());
     assert!(matches!(host.submit(mv).await.unwrap(), Reply::Receipt(_)));
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_resize_inputs_and_false_historical_guards_cannot_mint_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _) =
+        finish_pair(Peers::with_profile(dir.path(), 3, crate::lobby::LobbyFormat::Resizable).await)
+            .await;
+    let host = &p.game.node;
+    let capacity = rat_race_engine::LobbyCapacity::new(2).unwrap();
+    let guard = host.player_count_guard(ACTOR, capacity).await.unwrap();
+    let req = request(89);
+    let cmd = guard.sign(req, &key());
+    let envelope = fields(&cmd.0, &[1, 2]).unwrap();
+    let body = fields(envelope[&1], &[1, 2, 3, 4, 5, 12]).unwrap();
+    let material = fields(body[&5], &[1, 2, 3, 4, 5]).unwrap();
+    let mut bad_setup = material.clone();
+    bad_setup.insert(5, &[0; 8]);
+    let guest_id = p.learner.id();
+    let mut guest = material.clone();
+    guest.insert(1, &guest_id.0);
+    let wrap = |n: u8| message(&[(203, &message(&[(1, &[n])]))]);
+    let wrong_setup = message(&bad_setup.into_iter().collect::<Vec<_>>());
+    let guest_guard = message(&guest.into_iter().collect::<Vec<_>>());
+    for (leaf, g, actor, signer) in [
+        (wrap(1), body[&5], ACTOR, key()),
+        (wrap(11), body[&5], ACTOR, key()),
+        (wrap(3), body[&5], ACTOR, key()),
+        (wrap(2), wrong_setup.as_slice(), ACTOR, key()),
+        (
+            wrap(2),
+            guest_guard.as_slice(),
+            b"guest".as_slice(),
+            p.identity.clone(),
+        ),
+    ] {
+        let mut altered = body.clone();
+        altered.insert(3, actor);
+        altered.insert(5, g);
+        altered.insert(12, &leaf);
+        let raw = signed(&message(&altered.into_iter().collect::<Vec<_>>()), &signer);
+        assert!(host.submit(raw.clone()).await.is_err());
+        let mut db = host.replica.lock().unwrap();
+        let mut k = store::meta::<LogId>(&db, "applied").unwrap().unwrap();
+        k.index += 1;
+        let tx = db.transaction().unwrap();
+        let entry = Entry {
+            log_id: k,
+            payload: Source::blank().with_normal(raw),
+        };
+        assert!(host.replica.apply_in_transaction(&tx, &entry).is_err());
+        assert_eq!(host.replica.tip(&tx, "receipt").unwrap().0, 2);
+    }
+    let other = host
+        .seat_claim_guard(ACTOR, SeatId::new(1).unwrap())
+        .await
+        .unwrap()
+        .sign(req, &key());
+    host.submit(cmd.clone()).await.unwrap();
+    assert_eq!(host.submit(other).await.unwrap(), Reply::RequestIdConflict);
+    {
+        let mut db = host.replica.lock().unwrap();
+        let tx = db.transaction().unwrap();
+        assert_eq!(
+            tx.execute("UPDATE layout_history SET seats=x'0201'", [])
+                .unwrap(),
+            1
+        );
+        assert!(host.replica.verify_replay(&tx).is_err());
+    }
+    assert!(matches!(host.submit(cmd).await.unwrap(), Reply::Receipt(_)));
     p.shutdown().await;
 }

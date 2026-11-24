@@ -5,13 +5,14 @@ pub(super) struct Effect {
     pub(super) facts: Vec<u8>,
 }
 
-// Layout and Ready are fixed in these reducer profiles. Ready first becomes possible
+// Occupancy changes preserve the layout revision. Ready first becomes possible
 // in the profile that implements acknowledgments. Only actual occupancy changes advance setup.
 pub(super) fn commit(
     r: &Replica,
     db: &Transaction<'_>,
     index: u64,
     g: &SeatCommandGuard,
+    action: SeatAction,
     tr: SeatTransition,
 ) -> io::Result<Effect> {
     let before = setup_revision(db)?;
@@ -20,18 +21,15 @@ pub(super) fn commit(
         .ok_or(invalid("setup revision overflow"))?;
     let layout = g.layout.to_be_bytes();
     let ready = message(&[(1, &[0]), (2, &[0])]);
+    let (source_revision, target_revision) = match &g.material {
+        Dependencies::Occupancy(m) => (m.source_revision, m.target_revision),
+        Dependencies::Legacy => (0, 0),
+        Dependencies::Resize(_) => return Err(invalid("expected occupancy dependencies")),
+    };
     let mut numbers = vec![layout, layout];
     for (id, owner, prior) in [
-        (
-            tr.from,
-            None,
-            g.material.as_ref().map_or(0, |m| m.source_revision),
-        ),
-        (
-            tr.to,
-            Some(g.actor.as_slice()),
-            g.material.as_ref().map_or(0, |m| m.target_revision),
-        ),
+        (tr.from, None, source_revision),
+        (tr.to, Some(g.actor.as_slice()), target_revision),
     ] {
         if let Some(id) = id {
             let next = prior
@@ -52,7 +50,7 @@ pub(super) fn commit(
             numbers.extend([prior.to_be_bytes(), next.to_be_bytes()]);
         }
     }
-    store::put(db, "setup_revision", &after)?;
+    r.advance_setup(db, index, after)?;
     numbers.extend([before.to_be_bytes(), after.to_be_bytes()]);
     let revisions = message(
         &numbers
@@ -64,7 +62,7 @@ pub(super) fn commit(
     let old = tr.from.map(SeatId::get);
     let new = tr.to.map(SeatId::get);
     let actor = g.actor.as_slice();
-    let (record, mut facts) = match g.action {
+    let (record, mut facts) = match action {
         SeatAction::Claim(_) => (
             message(&[
                 (1, actor),

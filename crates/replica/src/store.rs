@@ -180,7 +180,15 @@ pub(crate) fn create_schema(
             previous_tip BLOB NOT NULL CHECK(length(previous_tip)=32), record BLOB NOT NULL,
             PRIMARY KEY(ledger,seq)) STRICT").map_err(io::Error::other)?;
     }
-    if lobby_format == Some(lobby::LobbyFormat::SeatChanges) {
+    if lobby_format == Some(lobby::LobbyFormat::Resizable) {
+        db.execute_batch("CREATE TABLE layout_history (
+           idx BLOB PRIMARY KEY CHECK(length(idx)=8), revision BLOB NOT NULL CHECK(length(revision)=8),
+           seats BLOB NOT NULL CHECK(length(seats) BETWEEN 2 AND 10)) STRICT;
+            CREATE TABLE setup_history (
+               idx BLOB PRIMARY KEY CHECK(length(idx)=8), revision BLOB NOT NULL CHECK(length(revision)=8)
+            ) STRICT").map_err(io::Error::other)?;
+    }
+    if lobby_format.is_some_and(lobby::LobbyFormat::seat_history) {
         db.execute_batch("CREATE TABLE seat_history (
             seat INTEGER NOT NULL CHECK(seat BETWEEN 1 AND 10), idx BLOB NOT NULL CHECK(length(idx)=8),
             revision BLOB NOT NULL CHECK(length(revision)=8), changed_by BLOB NOT NULL, occupant BLOB,

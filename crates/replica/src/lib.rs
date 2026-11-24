@@ -172,6 +172,7 @@ impl Replica {
         let version = database_version(&db)?;
         let expected_version = match lobby_format {
             Some(lobby::LobbyFormat::SemanticLinks) => 4,
+            Some(lobby::LobbyFormat::Resizable) => 7,
             Some(lobby::LobbyFormat::SeatChanges) => 6,
             Some(lobby::LobbyFormat::Seating) => 5,
             Some(lobby::LobbyFormat::Legacy) => 3,

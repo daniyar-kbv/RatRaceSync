@@ -1,6 +1,7 @@
 use super::*;
 mod changes;
 mod history;
+mod resize;
 mod restart;
 mod validation;
 use rat_race_engine::SeatId;

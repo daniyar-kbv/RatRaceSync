@@ -58,7 +58,17 @@ impl Replica {
                 ));
             }
         }
-        if self.lobby_format == Some(crate::lobby::LobbyFormat::SeatChanges)
+        if self.lobby_format == Some(crate::lobby::LobbyFormat::Resizable)
+            && (!same_rows(db, &replay, "SELECT * FROM layout_history ORDER BY idx")
+                .map_err(io::Error::other)?
+                || !same_rows(db, &replay, "SELECT * FROM setup_history ORDER BY idx")
+                    .map_err(io::Error::other)?)
+        {
+            return Err(invalid("layout history differs from committed replay"));
+        }
+        if self
+            .lobby_format
+            .is_some_and(crate::lobby::LobbyFormat::seat_history)
             && !same_rows(db, &replay, "SELECT * FROM seat_history ORDER BY seat,idx")
                 .map_err(io::Error::other)?
         {

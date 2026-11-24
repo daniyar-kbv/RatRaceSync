@@ -10,19 +10,15 @@ impl Snapshot {
     pub(super) fn at(
         r: &Replica,
         db: &Connection,
-        state: &LobbyCreated,
+        state: &OpenLayout,
         index: u64,
     ) -> io::Result<Self> {
-        let capacity = u8::try_from(state.target)
-            .ok()
-            .and_then(LobbyCapacity::new)
-            .ok_or(invalid("invalid lobby size"))?;
-        let mut table = LobbySeating::new(capacity);
+        let mut table = state.seats.clone();
         let mut revisions = BTreeMap::new();
         if r.seat_changes() {
             let mut query = db.prepare("SELECT occupant,revision FROM seat_history WHERE seat=? AND idx<=? ORDER BY idx DESC LIMIT 1").map_err(io::Error::other)?;
-            for n in capacity.ordered_seats() {
-                let seat = SeatId::new(n).ok_or(invalid("invalid seat"))?;
+            for (seat, _) in state.seats.seats() {
+                let n = seat.get();
                 let row = query
                     .query_row(params![n, index.to_be_bytes()], |row| {
                         Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, [u8; 8]>(1)?))
@@ -48,6 +44,9 @@ impl Snapshot {
             }
         }
         Ok(Self { table, revisions })
+    }
+    pub(super) fn seating(&self) -> &LobbySeating {
+        &self.table
     }
     pub(super) fn revision(&self, id: SeatId) -> u64 {
         self.revisions.get(&id).copied().unwrap_or(0)
