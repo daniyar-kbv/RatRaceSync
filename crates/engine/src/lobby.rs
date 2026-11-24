@@ -19,6 +19,19 @@ pub enum ClaimError {
     SeatUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeatAction {
+    Claim(SeatId),
+    Release,
+    Change(SeatId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeatTransition {
+    pub from: Option<SeatId>,
+    pub to: Option<SeatId>,
+}
+
 pub struct LobbySeating {
     occupants: BTreeMap<SeatId, Option<PlayerId>>,
 }
@@ -37,18 +50,34 @@ impl LobbySeating {
     pub fn occupant(&self, seat: SeatId) -> Option<&PlayerId> {
         self.occupants.get(&seat).and_then(Option::as_ref)
     }
+    /// Validate ownership and vacancy together before either seat changes.
+    pub fn transition(
+        &self,
+        actor: &PlayerId,
+        action: SeatAction,
+    ) -> Result<SeatTransition, ClaimError> {
+        let from = self
+            .seats()
+            .find(|(_, owner)| *owner == Some(actor))
+            .map(|(id, _)| id);
+        let to = match action {
+            SeatAction::Claim(_) if from.is_some() => return Err(ClaimError::AlreadySeated),
+            SeatAction::Release | SeatAction::Change(_) if from.is_none() => {
+                return Err(ClaimError::SeatUnavailable);
+            }
+            SeatAction::Claim(id) | SeatAction::Change(id) => match self.occupants.get(&id) {
+                None => return Err(ClaimError::UnknownSeat),
+                Some(Some(_)) => return Err(ClaimError::SeatUnavailable),
+                Some(None) => Some(id),
+            },
+            SeatAction::Release => None,
+        };
+        Ok(SeatTransition { from, to })
+    }
+
     pub fn claim(&mut self, actor: &PlayerId, seat: SeatId) -> Result<(), ClaimError> {
-        if self.occupants.values().flatten().any(|p| p == actor) {
-            return Err(ClaimError::AlreadySeated);
-        }
-        let place = self
-            .occupants
-            .get_mut(&seat)
-            .ok_or(ClaimError::UnknownSeat)?;
-        if place.is_some() {
-            return Err(ClaimError::SeatUnavailable);
-        }
-        *place = Some(actor.clone());
+        self.transition(actor, SeatAction::Claim(seat))?;
+        self.occupants.insert(seat, Some(actor.clone()));
         Ok(())
     }
 }

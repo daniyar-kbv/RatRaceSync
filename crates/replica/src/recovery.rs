@@ -58,6 +58,12 @@ impl Replica {
                 ));
             }
         }
+        if self.lobby_format == Some(crate::lobby::LobbyFormat::SeatChanges)
+            && !same_rows(db, &replay, "SELECT * FROM seat_history ORDER BY seat,idx")
+                .map_err(io::Error::other)?
+        {
+            return Err(invalid("seat history differs from committed replay"));
+        }
         if self
             .lobby_format
             .is_some_and(crate::lobby::LobbyFormat::semantic_links)

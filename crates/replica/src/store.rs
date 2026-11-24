@@ -180,6 +180,13 @@ pub(crate) fn create_schema(
             previous_tip BLOB NOT NULL CHECK(length(previous_tip)=32), record BLOB NOT NULL,
             PRIMARY KEY(ledger,seq)) STRICT").map_err(io::Error::other)?;
     }
+    if lobby_format == Some(lobby::LobbyFormat::SeatChanges) {
+        db.execute_batch("CREATE TABLE seat_history (
+            seat INTEGER NOT NULL CHECK(seat BETWEEN 1 AND 10), idx BLOB NOT NULL CHECK(length(idx)=8),
+            revision BLOB NOT NULL CHECK(length(revision)=8), changed_by BLOB NOT NULL, occupant BLOB,
+            PRIMARY KEY(seat,idx)) STRICT;
+            CREATE INDEX seat_actor_history ON seat_history(changed_by,idx)").map_err(io::Error::other)?;
+    }
     let event_table = if lobby_format.is_some() {
         "CREATE TABLE event (seq INTEGER PRIMARY KEY, actor BLOB NOT NULL, position BLOB,
          cash_after TEXT, units_after TEXT, record BLOB NOT NULL, digest BLOB NOT NULL, tip BLOB NOT NULL,

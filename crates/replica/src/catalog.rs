@@ -276,7 +276,7 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
-        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::Seating)
+        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::SeatChanges)
             .await
     }
 

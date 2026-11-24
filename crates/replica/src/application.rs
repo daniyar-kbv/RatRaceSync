@@ -224,8 +224,8 @@ impl Replica {
         let db = self.lock()?;
         self.verify_checkpoint(&db)?;
         if self.lobby_format.is_some() {
-            if seating::is_claim(&signed.0) {
-                return self.inspect_claim(&db, &signed.0);
+            if seating::is_seat_command(&signed.0) {
+                return self.inspect_seat(&db, &signed.0);
             }
             return self.inspect_lobby(&db, signed);
         }
@@ -490,8 +490,8 @@ impl Replica {
             Reply::Protocol
         } else if let Some(raw) = src.strip_prefix(&[1]) {
             if self.lobby_format.is_some() {
-                if seating::is_claim(raw) {
-                    self.apply_claim(tx, e.log_id, raw, &digest)?
+                if seating::is_seat_command(raw) {
+                    self.apply_seat(tx, e.log_id, raw, &digest)?
                 } else {
                     self.apply_lobby(tx, &k, raw, &digest)?
                 }

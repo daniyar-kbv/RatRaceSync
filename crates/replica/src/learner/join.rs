@@ -619,7 +619,7 @@ impl Replica {
         ]);
         let (events, prev_event) = self.tip(db, "event")?;
         let (receipts, prev_receipt) = self.tip(db, "receipt")?;
-        if self.lobby_format != Some(lobby::LobbyFormat::Seating)
+        if !self.seating_enabled()
             && (events, receipts) != (i64::from(change.ordinal) - 1, i64::from(change.ordinal) - 1)
         {
             return Err(invalid("unexpected history before Join"));
@@ -665,7 +665,7 @@ impl Replica {
             &prev_event,
             &frame(&[b"MemberJoined/v1", &semantic]),
         )?;
-        let receipt_fields = if self.lobby_format == Some(lobby::LobbyFormat::Seating) {
+        let receipt_fields = if self.seating_enabled() {
             frame(&[
                 b"JoinReceipt/v2",
                 &receipt_seq.to_be_bytes(),
@@ -729,7 +729,7 @@ impl Replica {
         )
         .map_err(io::Error::other)?;
         store::put(db, change.slot, &member)?;
-        if self.lobby_format == Some(lobby::LobbyFormat::Seating) {
+        if self.seating_enabled() {
             store::put(db, "setup_revision", &member.setup_revision)?;
         }
         Ok(receipt)

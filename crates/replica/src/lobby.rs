@@ -15,24 +15,34 @@ pub(crate) enum LobbyFormat {
     Legacy,
     SemanticLinks,
     Seating,
+    SeatChanges,
 }
 
 impl LobbyFormat {
     pub(crate) fn semantic_links(self) -> bool {
         self != Self::Legacy
     }
+    pub(crate) fn seating(self) -> bool {
+        matches!(self, Self::Seating | Self::SeatChanges)
+    }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::SeatChanges => b"RatRaceSync/Classic101/lobby/v4",
             Self::Seating => b"RatRaceSync/Classic101/lobby/v3",
         }
     }
     fn parse(bytes: &[u8]) -> io::Result<Self> {
-        [Self::Legacy, Self::SemanticLinks, Self::Seating]
-            .into_iter()
-            .find(|f| f.profile() == bytes)
-            .ok_or(invalid("unsupported Create profile"))
+        [
+            Self::Legacy,
+            Self::SemanticLinks,
+            Self::Seating,
+            Self::SeatChanges,
+        ]
+        .into_iter()
+        .find(|f| f.profile() == bytes)
+        .ok_or(invalid("unsupported Create profile"))
     }
 }
 
@@ -382,7 +392,7 @@ impl Replica {
                 let (record, tip) = receipt.encode(&prev_receipt, &result_digest);
                 (record, tip, legacy_event_tip)
             }
-            LobbyFormat::SemanticLinks | LobbyFormat::Seating => {
+            LobbyFormat::SemanticLinks | LobbyFormat::Seating | LobbyFormat::SeatChanges => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();
@@ -444,7 +454,7 @@ impl Replica {
         )
         .map_err(io::Error::other)?;
         store::put(tx, "lobby", &data)?;
-        if c.format == LobbyFormat::Seating {
+        if c.format.seating() {
             store::put(tx, "setup_revision", &created.setup_revision)?;
         }
         tx.execute(

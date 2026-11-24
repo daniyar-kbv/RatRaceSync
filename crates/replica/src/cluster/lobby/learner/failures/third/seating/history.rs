@@ -101,3 +101,115 @@ async fn older_lobby_rejects_claims_and_preserves_its_signed_root() {
     );
     reopened.node.raft.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn learner_recovers_winning_occupancy_and_receipt_only_loser_after_a_move_race() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, join) = finish_pair(
+        Peers::with_profile(dir.path(), 3, crate::lobby::LobbyFormat::SeatChanges).await,
+    )
+    .await;
+    let host = &p.game.node;
+    let one = SeatId::new(1).unwrap();
+    let two = SeatId::new(2).unwrap();
+    let three = SeatId::new(3).unwrap();
+    let host_claim = host
+        .seat_claim_guard(ACTOR, one)
+        .await
+        .unwrap()
+        .sign(request(65), &key());
+    // Acquiring and releasing an unrelated seat leaves this original eligible.
+    host.submit(
+        host.seat_claim_guard(b"guest", three)
+            .await
+            .unwrap()
+            .sign(request(66), &p.identity),
+    )
+    .await
+    .unwrap();
+    host.submit(
+        host.seat_release_guard(b"guest")
+            .await
+            .unwrap()
+            .sign(request(67), &p.identity),
+    )
+    .await
+    .unwrap();
+    host.submit(host_claim).await.unwrap();
+    let change = host
+        .seat_change_guard(ACTOR, two)
+        .await
+        .unwrap()
+        .sign(request(68), &key());
+    let claim = host
+        .seat_claim_guard(b"guest", two)
+        .await
+        .unwrap()
+        .sign(request(69), &p.identity);
+    for cmd in [&change, &claim] {
+        assert!(host.replica.preflight(cmd).unwrap().is_none());
+    }
+    let (m, c) = tokio::join!(
+        host.raft.client_write(change),
+        host.raft.client_write(claim)
+    );
+    let (m, c) = (m.unwrap(), c.unwrap());
+    let moved = m.log_id.index < c.log_id.index;
+    let (winner, loser, op, owner) = if moved {
+        (m, c, 206, ACTOR)
+    } else {
+        (c, m, 204, b"guest".as_slice())
+    };
+    let won = receipt(winner.data);
+    let lost = receipt(loser.data);
+    let f = fields(&lost, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+    assert_eq!(fields(f[&7], &[13]).unwrap()[&13], [8, 1]);
+    assert!(f[&8].is_empty());
+    let view = host.lobby_seating(ACTOR).await.unwrap();
+    assert_eq!(
+        view.seats[0].occupant.as_deref(),
+        if moved { None } else { Some(ACTOR) }
+    );
+    assert_eq!(view.seats[1].occupant.as_deref(), Some(owner));
+    assert_eq!((view.seats[2].revision, view.setup_revision), (2, 6));
+    p.learner
+        .node
+        .raft
+        .wait(Some(Duration::from_secs(6)))
+        .applied_index_at_least(Some(loser.log_id.index), "seat race applied")
+        .await
+        .unwrap();
+    host.certify_recovery_tail(&key(), async |req| {
+        p.learner
+            .node
+            .answer_history_request(p.game.creator_node, req, &p.identity)
+    })
+    .await
+    .unwrap();
+    let mut r = admit_to_pair(dir.path(), (p, join)).await;
+    r.recover().await;
+    assert!(r.third.joined_node().is_err());
+    {
+        let db = r.third.node.replica.lock().unwrap();
+        r.third.node.replica.verify_replay(&db).unwrap();
+        for (seq, original) in [(6, &won), (7, &lost)] {
+            let actual: Vec<u8> = db
+                .query_row("SELECT record FROM receipt WHERE seq=?", [seq], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(&actual, original);
+        }
+        let actual: Vec<u8> = db
+            .query_row("SELECT record FROM event WHERE seq=6", [], |row| row.get(0))
+            .unwrap();
+        let event = fields(&actual, &[1, 2, 3, 4, 5, 6, 7]).unwrap();
+        assert_eq!(
+            fields(event[&6], &[op]).unwrap()[&op],
+            super::changes::seat_effect(&won, op)
+        );
+        assert_eq!(r.third.node.replica.tip(&db, "event").unwrap().0, 6);
+    }
+    r.third.shutdown().await.unwrap();
+    r.p.shutdown().await;
+}

@@ -64,6 +64,7 @@ pub(crate) fn invitation(
     let format = [
         lobby::LobbyFormat::SemanticLinks,
         lobby::LobbyFormat::Seating,
+        lobby::LobbyFormat::SeatChanges,
     ]
     .into_iter()
     .find(|f| body[&11] == genesis::profile_manifest(f.profile()))
