@@ -11,6 +11,10 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use tokio::time::{sleep, timeout};
 
 type AuthorityMap = Arc<Mutex<BTreeMap<ReplicaId, (PromotionAuthority, SigningKey)>>>;
+struct PausedReplication {
+    command: Vec<u8>,
+    attempted: Arc<tokio::sync::Notify>,
+}
 #[derive(Clone, Default)]
 struct Bus(
     Arc<Mutex<BTreeMap<ReplicaId, Raft>>>,
@@ -19,6 +23,7 @@ struct Bus(
     Arc<std::sync::atomic::AtomicBool>,
     Arc<Mutex<Vec<ReplicaId>>>,
     AuthorityMap,
+    Arc<Mutex<Option<PausedReplication>>>,
 );
 struct Peer {
     bus: Bus,
@@ -85,6 +90,14 @@ impl RaftNetworkV2<Types> for Peer {
     ) -> Result<AppendResult<Types>, RPCError<Types>> {
         let learner = self.bus.1.lock().unwrap().get(&self.id).cloned();
         if let Some((sender, peer)) = learner {
+            if let Some(paused) = self.bus.6.lock().unwrap().as_ref()
+                && r.entries.iter().any(|entry| {
+                    entry.payload.bytes.strip_prefix(&[1]) == Some(paused.command.as_slice())
+                })
+            {
+                paused.attempted.notify_one();
+                return Err(Unreachable::from_string("application replication paused").into());
+            }
             if self.bus.4.lock().unwrap().contains(&self.id)
                 && r.entries.iter().any(|entry| {
                     entry

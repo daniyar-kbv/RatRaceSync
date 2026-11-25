@@ -430,6 +430,14 @@ impl SeatCommand {
             None => Ok(None),
         }
     }
+    fn committed_source(&self, db: &Connection) -> io::Result<Option<Signed>> {
+        self.committed_receipt(db)?
+            .map(|record| {
+                archived_seat_command(db, &record)?
+                    .ok_or(invalid("expected committed seat command"))
+            })
+            .transpose()
+    }
     fn original(&self, db: &Connection) -> io::Result<Option<Reply>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = db
             .query_row(
@@ -514,7 +522,7 @@ impl GameNode {
         if r.local_node != Some(command.guard.node) {
             return Err(invalid("seat command belongs to another installation"));
         }
-        let committed = command.committed_receipt(&tx)?;
+        let committed = command.committed_source(&tx)?;
         let name = local_request_key(command.guard.node, request);
         if let Some(saved) = store::meta::<Signed>(&tx, &name)? {
             let original = SeatCommand::verify(r, &tx, &saved.0)?;
@@ -525,16 +533,9 @@ impl GameNode {
                     "seat request already reserved with different intent",
                 ));
             }
-            return Ok(saved);
+            return Ok(committed.unwrap_or(saved));
         }
-        // A recovered installation may have the consensus history before it has a local
-        // reservation. Preserve the original signed bytes even for alternate field order.
-        let raw = if let Some(record) = committed {
-            archived_seat_command(&tx, &record)?
-                .ok_or(invalid("expected committed seat command"))?
-        } else {
-            raw
-        };
+        let raw = committed.unwrap_or(raw);
         store::put(&tx, &name, &raw)?;
         tx.commit().map_err(io::Error::other)?;
         Ok(raw)
@@ -592,15 +593,16 @@ impl GameNode {
         };
         if let Some(raw) = &saved {
             let command = SeatCommand::verify(r, &db, &raw.0)?;
-            command.committed_receipt(&db)?;
             if command.request != request
                 || command.guard.node != node
                 || command.guard.actor != actor
             {
                 return Err(invalid("wrong saved seat intent"));
             }
+            // A local reservation can have another supported encoding of the same intent.
+            return Ok(command.committed_source(&db)?.or(saved));
         }
-        Ok(saved)
+        Ok(None)
     }
     /// The transport authenticates the requesting actor; only joined participants may read.
     pub async fn lobby_seating(&self, actor: &[u8]) -> io::Result<LobbySeatView> {

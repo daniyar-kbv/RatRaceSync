@@ -475,6 +475,173 @@ async fn changing_an_acknowledged_dream_resets_only_its_owner_and_keeps_real_pri
     p.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_deliveries_of_one_dream_request_have_one_original_log_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _) =
+        finish_pair(Peers::with_profile(dir.path(), 3, LobbyFormat::DreamReady).await).await;
+    let leader = &p.game.node;
+    let intent = LobbyIntent::sign(
+        &leader.replica.session,
+        ACTOR,
+        request(112),
+        LobbyPreference::Dream(DreamId::new(9).unwrap()),
+        &key(),
+    );
+    let peer = p.game.creator_node;
+    let witness = leader
+        .preference_witness(peer, &intent, &key())
+        .await
+        .unwrap();
+    let raw = leader
+        .prepare_preference(&intent, &witness, &key())
+        .unwrap();
+    let (first, retry) = tokio::join!(
+        leader.submit_preference(peer, raw.clone()),
+        leader.submit_preference(peer, raw.clone()),
+    );
+    assert_eq!(receipt(first.unwrap()), receipt(retry.unwrap()));
+    let mut source = vec![1];
+    source.extend(raw.0);
+    let copies: i64 = leader
+        .replica
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM archive WHERE source=?",
+            [source],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        copies, 1,
+        "one signed request must own exactly one Raft entry"
+    );
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_returns_the_committed_encoding_when_a_local_reservation_also_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _) =
+        finish_pair(Peers::with_profile(dir.path(), 3, LobbyFormat::DreamReady).await).await;
+    let leader = &p.game.node;
+    let peer = p.game.creator_node;
+    let id = request(113);
+    let intent = LobbyIntent::sign(
+        &leader.replica.session,
+        ACTOR,
+        id,
+        LobbyPreference::Dream(DreamId::new(6).unwrap()),
+        &key(),
+    );
+    let witness = leader
+        .preference_witness(peer, &intent, &key())
+        .await
+        .unwrap();
+    let saved = leader
+        .prepare_preference(&intent, &witness, &key())
+        .unwrap();
+    let envelope = fields(&saved.0, &[1, 2]).unwrap();
+    let committed = Signed(message(&[(2, envelope[&2]), (1, envelope[&1])]));
+    assert_ne!(saved.0, committed.0);
+    let original = leader
+        .submit_preference(peer, committed.clone())
+        .await
+        .unwrap();
+    let recovered = leader
+        .saved_seat_command(ACTOR, id, &key())
+        .unwrap()
+        .unwrap();
+    assert!(
+        recovered.0 == committed.0,
+        "recovery chose the local encoding over the committed source"
+    );
+    let prepared = leader
+        .prepare_preference(&intent, &witness, &key())
+        .unwrap();
+    assert!(
+        prepared.0 == committed.0,
+        "preparation must return the archived original"
+    );
+    assert_eq!(
+        leader.submit_preference(peer, recovered).await.unwrap(),
+        original
+    );
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_delivery_keeps_its_request_until_raft_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _) =
+        finish_pair(Peers::with_profile(dir.path(), 3, LobbyFormat::DreamReady).await).await;
+    let leader = &p.game.node;
+    let peer = p.game.creator_node;
+    let id = request(114);
+    let dream = guard(
+        leader,
+        ACTOR,
+        &key(),
+        114,
+        LobbyPreference::Dream(DreamId::new(7).unwrap()),
+        &key(),
+    )
+    .await
+    .unwrap()
+    .sign(id, &key());
+    // A different source operation competes for the same actor's UUID.
+    let resize = leader
+        .player_count_guard(ACTOR, LobbyCapacity::new(2).unwrap())
+        .await
+        .unwrap()
+        .sign(id, &key());
+    let attempted = Arc::new(tokio::sync::Notify::new());
+    *p.bus.6.lock().unwrap() = Some(PausedReplication {
+        command: dream.0.clone(),
+        attempted: attempted.clone(),
+    });
+    let before = leader.raft.metrics().borrow_watched().last_applied.unwrap();
+    let pending = tokio::spawn({
+        let leader = leader.clone();
+        let dream = dream.clone();
+        async move { leader.submit_preference(peer, dream).await }
+    });
+    timeout(Duration::from_secs(5), attempted.notified())
+        .await
+        .unwrap();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    let retry = leader.submit_preference(peer, dream);
+    let different = leader.submit(resize);
+    let deliveries = async { tokio::join!(retry, different) };
+    tokio::pin!(deliveries);
+    assert!(
+        timeout(Duration::from_millis(120), &mut deliveries)
+            .await
+            .is_err()
+    );
+    p.bus.6.lock().unwrap().take();
+    let (retry, different) = timeout(Duration::from_secs(6), deliveries).await.unwrap();
+    assert_eq!(different.unwrap(), Reply::RequestIdConflict);
+    let record = receipt(retry.unwrap());
+    let committed = fields(&record, &[1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap()[&5];
+    {
+        let db = leader.replica.lock().unwrap();
+        let logs = db
+            .prepare(
+                "SELECT log_id FROM archive WHERE idx>? AND substr(source,1,1)=x'01' ORDER BY idx",
+            )
+            .unwrap()
+            .query_map([before.index.to_be_bytes()], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(logs, [committed]);
+    }
+    p.shutdown().await;
+}
+
 pub(super) async fn guard(
     h: &GameNode,
     actor: &[u8],

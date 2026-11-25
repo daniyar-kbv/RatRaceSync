@@ -4,10 +4,20 @@ use openraft::{
     network::{NetSnapshot, RaftNetworkFactory},
 };
 
+use futures::lock::{Mutex as AsyncMutex, OwnedMutexGuard};
+use openraft::type_config::TypeConfigExt;
+use std::{collections::HashMap, sync::Weak};
+
 pub type Raft = openraft::Raft<Types, Replica>;
+
+// Receipt ownership is per game, actor and UUID. All normal command families on
+// this node use the same admission lock for that identity.
+type RequestKey = (Vec<u8>, [u8; 16]);
+type PendingRequests = Mutex<HashMap<RequestKey, Weak<AsyncMutex<()>>>>;
 pub struct GameNode {
     pub(crate) raft: Raft,
     pub(crate) replica: Replica,
+    pending_requests: PendingRequests,
     pub(crate) sealer: Mutex<Option<learner::SealWorker>>,
 }
 #[derive(Debug)]
@@ -56,6 +66,7 @@ impl GameNode {
             raft,
             replica,
             sealer: Default::default(),
+            pending_requests: Default::default(),
         })
     }
     pub async fn submit(&self, signed: Signed) -> Result<Reply, SubmitError> {
@@ -82,7 +93,43 @@ impl GameNode {
         }
         self.submit_authorized(signed).await
     }
+    async fn request_permit(&self, signed: &Signed) -> io::Result<OwnedMutexGuard<()>> {
+        if signed.0.len() > 2048 {
+            return Err(invalid("oversized command"));
+        }
+        let envelope = wire::fields(&signed.0, &[1, 2])?;
+        let family = if self.replica.lobby_format.is_some() {
+            12
+        } else {
+            11
+        };
+        let body = wire::fields(envelope[&1], &[1, 2, 3, 4, 5, family])?;
+        let key = (
+            body[&3].to_vec(),
+            body[&4].try_into().map_err(io::Error::other)?,
+        );
+        let lock = {
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .map_err(|_| io::Error::other("request admission unavailable"))?;
+            pending.retain(|_, lock| lock.strong_count() > 0);
+            let entry = pending.entry(key).or_default();
+            if let Some(lock) = entry.upgrade() {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                *entry = Arc::downgrade(&lock);
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
+    }
     async fn submit_authorized(&self, signed: Signed) -> Result<Reply, SubmitError> {
+        let permit = self
+            .request_permit(&signed)
+            .await
+            .map_err(SubmitError::PreflightFailed)?;
         self.raft
             .ensure_linearizable(ReadPolicy::ReadIndex)
             .await
@@ -94,11 +141,17 @@ impl GameNode {
         {
             return Ok(reply);
         }
-        self.raft
-            .client_write(signed)
-            .await
-            .map(|v| v.data)
-            .map_err(|_| SubmitError::ReconciliationRequired)
+        // Once submitted, Raft may commit even if the transport drops its caller.
+        // Keep ownership until the write resolves. A waiting retry then reads the
+        // current leader's applied history before deciding whether to submit.
+        let raft = self.raft.clone();
+        Types::spawn(async move {
+            let _permit = permit;
+            raft.client_write(signed).await.map(|v| v.data)
+        })
+        .await
+        .map_err(|_| SubmitError::ReconciliationRequired)?
+        .map_err(|_| SubmitError::ReconciliationRequired)
     }
     /// Trusted adapter entry point. The caller must authenticate the actor and
     /// establish owner read permission before requesting their position guard.
