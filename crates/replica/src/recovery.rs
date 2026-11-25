@@ -58,7 +58,19 @@ impl Replica {
                 ));
             }
         }
-        if self.lobby_format == Some(crate::lobby::LobbyFormat::Resizable)
+        if self.lobby_format == Some(crate::lobby::LobbyFormat::DreamReady) {
+            for sql in [
+                "SELECT * FROM dream_history ORDER BY actor,idx",
+                "SELECT * FROM ready_history ORDER BY actor,idx",
+            ] {
+                if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
+                    return Err(invalid("player setup differs from committed replay"));
+                }
+            }
+        }
+        if self
+            .lobby_format
+            .is_some_and(crate::lobby::LobbyFormat::resizable)
             && (!same_rows(db, &replay, "SELECT * FROM layout_history ORDER BY idx")
                 .map_err(io::Error::other)?
                 || !same_rows(db, &replay, "SELECT * FROM setup_history ORDER BY idx")

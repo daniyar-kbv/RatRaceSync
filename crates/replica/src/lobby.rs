@@ -17,6 +17,7 @@ pub(crate) enum LobbyFormat {
     Seating,
     SeatChanges,
     Resizable,
+    DreamReady,
 }
 
 impl LobbyFormat {
@@ -24,27 +25,35 @@ impl LobbyFormat {
         self != Self::Legacy
     }
     pub(crate) fn seating(self) -> bool {
-        matches!(self, Self::Seating | Self::SeatChanges | Self::Resizable)
+        matches!(
+            self,
+            Self::Seating | Self::SeatChanges | Self::Resizable | Self::DreamReady
+        )
     }
     pub(crate) fn seat_history(self) -> bool {
-        matches!(self, Self::SeatChanges | Self::Resizable)
+        matches!(self, Self::SeatChanges | Self::Resizable | Self::DreamReady)
+    }
+    pub(crate) fn resizable(self) -> bool {
+        matches!(self, Self::Resizable | Self::DreamReady)
     }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::DreamReady => b"RatRaceSync/Classic101/lobby/v6",
             Self::Resizable => b"RatRaceSync/Classic101/lobby/v5",
             Self::SeatChanges => b"RatRaceSync/Classic101/lobby/v4",
             Self::Seating => b"RatRaceSync/Classic101/lobby/v3",
         }
     }
-    fn parse(bytes: &[u8]) -> io::Result<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> io::Result<Self> {
         [
             Self::Legacy,
             Self::SemanticLinks,
             Self::Seating,
             Self::SeatChanges,
             Self::Resizable,
+            Self::DreamReady,
         ]
         .into_iter()
         .find(|f| f.profile() == bytes)
@@ -401,7 +410,8 @@ impl Replica {
             LobbyFormat::SemanticLinks
             | LobbyFormat::Seating
             | LobbyFormat::SeatChanges
-            | LobbyFormat::Resizable => {
+            | LobbyFormat::Resizable
+            | LobbyFormat::DreamReady => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();

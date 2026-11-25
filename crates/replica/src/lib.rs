@@ -14,7 +14,10 @@ mod node;
 mod recovery;
 mod seating;
 pub use rat_race_engine::SeatId;
-pub use seating::{LobbySeat, LobbySeatView, SeatClaimGuard, SeatCommandGuard};
+pub use seating::{
+    LobbyIntent, LobbyPreference, LobbySeat, LobbySeatView, OwnLobbyPreference, OwnPreferenceRead,
+    SeatClaimGuard, SeatCommandGuard,
+};
 mod store;
 mod types;
 mod wire;
@@ -173,6 +176,7 @@ impl Replica {
         let expected_version = match lobby_format {
             Some(lobby::LobbyFormat::SemanticLinks) => 4,
             Some(lobby::LobbyFormat::Resizable) => 7,
+            Some(lobby::LobbyFormat::DreamReady) => 8,
             Some(lobby::LobbyFormat::SeatChanges) => 6,
             Some(lobby::LobbyFormat::Seating) => 5,
             Some(lobby::LobbyFormat::Legacy) => 3,

@@ -3,7 +3,10 @@
 mod integer;
 mod lobby;
 pub use integer::{Integer, InvalidInteger};
-pub use lobby::{ClaimError, LobbyCapacity, LobbySeating, SeatAction, SeatId, SeatTransition};
+pub use lobby::{
+    ClaimError, DreamId, LobbyCapacity, LobbyPreference, LobbySeating, PreferenceTransition,
+    SeatAction, SeatId, SeatTransition,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

@@ -66,6 +66,7 @@ pub(crate) fn invitation(
         lobby::LobbyFormat::Seating,
         lobby::LobbyFormat::SeatChanges,
         lobby::LobbyFormat::Resizable,
+        lobby::LobbyFormat::DreamReady,
     ]
     .into_iter()
     .find(|f| body[&11] == genesis::profile_manifest(f.profile()))

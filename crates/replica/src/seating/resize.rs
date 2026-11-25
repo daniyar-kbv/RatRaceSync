@@ -42,6 +42,7 @@ impl Resize {
 
     pub(super) fn commit(
         &self,
+        r: &Replica,
         db: &Transaction<'_>,
         index: u64,
         revision: u64,
@@ -57,14 +58,17 @@ impl Resize {
         .map_err(io::Error::other)?;
         let mut retained = Vec::new();
         let mut retained_facts = Vec::new();
-        // This profile has no Ready command. Every retained seat owner is unacknowledged.
         for (id, owner) in &self.occupied {
+            let ready = [u8::from(
+                r.lobby_format == Some(lobby::LobbyFormat::DreamReady)
+                    && preference::effective(db, owner, index)?.ready,
+            )];
             wire::field(
                 &mut retained,
                 1,
-                &message(&[(1, &[id.get()]), (2, owner), (3, &[0])]),
+                &message(&[(1, &[id.get()]), (2, owner), (3, &ready)]),
             );
-            retained_facts.extend(frame(&[&[id.get()], owner, &[0]]));
+            retained_facts.extend(frame(&[&[id.get()], owner, &ready]));
         }
         let before = [self.before];
         let target = [seats.len() as u8];
@@ -119,7 +123,7 @@ pub(crate) fn layout_at(db: &Connection, index: u64) -> io::Result<OpenLayout> {
     if order.len() != created.target as usize {
         return Err(invalid("inconsistent initial seat count"));
     }
-    if created.profile == lobby::LobbyFormat::Resizable.profile() {
+    if lobby::LobbyFormat::parse(&created.profile)?.resizable() {
         let row = db
             .query_row(
                 "SELECT revision,seats FROM layout_history WHERE idx<=? ORDER BY idx DESC LIMIT 1",

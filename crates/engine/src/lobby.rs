@@ -140,6 +140,53 @@ impl LobbySeating {
     }
 }
 
+/// Opaque selection in the pinned 23-choice lobby profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DreamId(u8);
+
+impl DreamId {
+    pub fn new(value: u8) -> Option<Self> {
+        (1..=23).contains(&value).then_some(Self(value))
+    }
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LobbyPreference {
+    Dream(DreamId),
+    Ready(bool),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreferenceTransition {
+    Select(DreamId),
+    Acknowledge(bool),
+    Unchanged,
+}
+impl LobbyPreference {
+    /// A current acknowledgment includes the actor's still-valid seat and selection.
+    pub fn transition(
+        self,
+        seat: Option<SeatId>,
+        dream: Option<DreamId>,
+        acknowledged: Option<bool>,
+    ) -> Option<PreferenceTransition> {
+        match self {
+            Self::Dream(next) if Some(next) != dream => Some(PreferenceTransition::Select(next)),
+            Self::Ready(value) if seat.is_some() && dream.is_some() => {
+                Some(if acknowledged == Some(value) {
+                    PreferenceTransition::Unchanged
+                } else {
+                    PreferenceTransition::Acknowledge(value)
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The host chooses a fixed physical seat order. Creation leaves every seat vacant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LobbyCapacity(u8);

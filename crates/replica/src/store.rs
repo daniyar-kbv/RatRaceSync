@@ -180,7 +180,11 @@ pub(crate) fn create_schema(
             previous_tip BLOB NOT NULL CHECK(length(previous_tip)=32), record BLOB NOT NULL,
             PRIMARY KEY(ledger,seq)) STRICT").map_err(io::Error::other)?;
     }
-    if lobby_format == Some(lobby::LobbyFormat::Resizable) {
+    if lobby_format == Some(lobby::LobbyFormat::DreamReady) {
+        db.execute_batch("CREATE TABLE dream_history(actor BLOB NOT NULL,idx BLOB NOT NULL,dream INTEGER NOT NULL CHECK(dream BETWEEN 1 AND 23),PRIMARY KEY(actor,idx)) STRICT;
+            CREATE TABLE ready_history(actor BLOB NOT NULL,idx BLOB NOT NULL,ready INTEGER NOT NULL CHECK(ready IN (0,1)),PRIMARY KEY(actor,idx)) STRICT").map_err(io::Error::other)?;
+    }
+    if lobby_format.is_some_and(lobby::LobbyFormat::resizable) {
         db.execute_batch("CREATE TABLE layout_history (
            idx BLOB PRIMARY KEY CHECK(length(idx)=8), revision BLOB NOT NULL CHECK(length(revision)=8),
            seats BLOB NOT NULL CHECK(length(seats) BETWEEN 2 AND 10)) STRICT;

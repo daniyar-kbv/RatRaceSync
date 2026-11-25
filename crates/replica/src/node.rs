@@ -59,6 +59,30 @@ impl GameNode {
         })
     }
     pub async fn submit(&self, signed: Signed) -> Result<Reply, SubmitError> {
+        if seating::preference_actor(&signed.0).is_some() {
+            return Err(SubmitError::PreflightFailed(invalid(
+                "private receipt requires authenticated owner",
+            )));
+        }
+        self.submit_authorized(signed).await
+    }
+    /// The transport supplies the authenticated installation for this private reply.
+    pub async fn submit_preference(
+        &self,
+        peer: ReplicaId,
+        signed: Signed,
+    ) -> Result<Reply, SubmitError> {
+        let actor = seating::preference_actor(&signed.0).ok_or_else(|| {
+            SubmitError::PreflightFailed(invalid("expected player setup command"))
+        })?;
+        {
+            let db = self.replica.lock().map_err(SubmitError::PreflightFailed)?;
+            seating::authenticated_member(&db, actor, peer)
+                .map_err(SubmitError::PreflightFailed)?;
+        }
+        self.submit_authorized(signed).await
+    }
+    async fn submit_authorized(&self, signed: Signed) -> Result<Reply, SubmitError> {
         self.raft
             .ensure_linearizable(ReadPolicy::ReadIndex)
             .await

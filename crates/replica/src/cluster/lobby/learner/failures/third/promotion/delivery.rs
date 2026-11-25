@@ -86,7 +86,7 @@ async fn stale_prefix_refresh_preserves_original_request_and_retry_skips_old_vot
     r.p.shutdown().await;
 }
 
-async fn elect_second(r: &Recovery) {
+pub(in crate::cluster::lobby::learner::failures::third) async fn elect_second(r: &Recovery) {
     let host = &r.p.game.node;
     let second = &r.p.learner.node;
     host.raft.runtime_config().elect(false);

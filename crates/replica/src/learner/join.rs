@@ -276,7 +276,7 @@ impl InstallationCatalog {
             return Err(invalid("refresh verified learner prefix"));
         }
         let lobby = seating::layout_at(&tx, verified.index)?;
-        if r.lobby_format == Some(lobby::LobbyFormat::Resizable) {
+        if r.lobby_format.is_some_and(lobby::LobbyFormat::resizable) {
             if store::meta::<Vec<u8>>(&tx, &retired_join_key(request))?.is_some() {
                 return Err(invalid("obsolete Join request"));
             }
@@ -287,7 +287,7 @@ impl InstallationCatalog {
         if let Some(old) = previous.as_ref().filter(|_| replacing) {
             // This certified prefix contains a later layout and no admission of this player.
             // LastLogId and the signed layout guard fence every delivery of the prior intent.
-            if r.lobby_format != Some(lobby::LobbyFormat::Resizable)
+            if r.lobby_format.is_none_or(|f| !f.resizable())
                 || old.layout >= lobby.layout_revision
                 || original_join(&tx, old)?.is_some()
             {

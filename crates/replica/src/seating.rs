@@ -1,5 +1,7 @@
 //! Signed seat commands against committed, public lobby occupancy.
 mod effect;
+mod preference;
+pub use preference::{LobbyIntent, LobbyPreference, OwnLobbyPreference, OwnPreferenceRead};
 mod resize;
 mod state;
 use crate::{
@@ -31,10 +33,19 @@ pub struct SeatCommandGuard {
     layout: u64,
     action: TableAction,
     material: Dependencies,
+    witness: Option<[u8; 64]>,
+    actor_proof: Vec<u8>,
 }
 pub type SeatClaimGuard = SeatCommandGuard;
 impl SeatCommandGuard {
     fn guard(&self) -> Vec<u8> {
+        let mut guard = self.detached_guard();
+        if matches!(&self.material, Dependencies::Preference(_)) {
+            wire::field(&mut guard, 7, &self.actor_proof);
+        }
+        guard
+    }
+    fn detached_guard(&self) -> Vec<u8> {
         let mut bytes = message(&[
             (1, &self.node.0),
             (2, &1u64.to_be_bytes()),
@@ -44,6 +55,14 @@ impl SeatCommandGuard {
         match &self.material {
             Dependencies::Occupancy(m) => m.append_guard(&mut bytes),
             Dependencies::Resize(setup) => wire::field(&mut bytes, 5, &setup.to_be_bytes()),
+            Dependencies::Preference(m) => {
+                wire::field(&mut bytes, 5, &m.setup.to_be_bytes());
+                wire::field(
+                    &mut bytes,
+                    6,
+                    self.witness.as_ref().map_or(&[][..], |s| s.as_slice()),
+                );
+            }
             Dependencies::Legacy => wire::field(&mut bytes, 5, &0u64.to_be_bytes()),
         }
         bytes
@@ -63,6 +82,12 @@ impl SeatCommandGuard {
     }
     fn fingerprint(&self, request: &[u8; 16]) -> [u8; 32] {
         let (tag, target) = operation(self.action);
+        if let Dependencies::Preference(m) = &self.material {
+            return hash(
+                b"player-setup-intent/v1",
+                &[&self.dependency_scope(request, m)],
+            );
+        }
         if let Dependencies::Resize(setup) = &self.material {
             return hash(
                 b"lobby-count-intent/v1",
@@ -172,21 +197,27 @@ fn player(actor: &[u8]) -> io::Result<PlayerId> {
 enum TableAction {
     Occupancy(SeatAction),
     Resize(LobbyCapacity),
+    Preference(LobbyPreference),
 }
 #[derive(Clone, Eq, PartialEq)]
 enum Dependencies {
     Legacy,
     Occupancy(Material),
     Resize(u64),
+    Preference(preference::Material),
 }
 enum Change {
     Occupancy(SeatAction, SeatTransition),
     Resize(resize::Resize),
+    Preference(preference::Transition),
 }
 impl TableAction {
     fn guard_tags(self, r: &Replica) -> io::Result<&'static [u32]> {
         match self {
-            Self::Resize(_) if r.lobby_format == Some(lobby::LobbyFormat::Resizable) => {
+            Self::Preference(_) if r.lobby_format == Some(lobby::LobbyFormat::DreamReady) => {
+                Ok(&[1, 2, 3, 4, 5, 6, 7])
+            }
+            Self::Resize(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::resizable) => {
                 Ok(&[1, 2, 3, 4, 5])
             }
             Self::Occupancy(_) if r.seat_changes() => Ok(&[1, 2, 3, 4, 5, 6, 7, 8]),
@@ -214,6 +245,7 @@ impl TableAction {
                 };
                 Ok((Change::Occupancy(action, tr), material))
             }
+            Self::Preference(action) => preference::evaluate(db, &table, actor, index, action),
             Self::Resize(target) => {
                 if actor != state.host {
                     return Err(invalid("only the lobby host can resize"));
@@ -231,6 +263,7 @@ impl TableAction {
 }
 fn operation(action: TableAction) -> (u32, Option<u8>) {
     match action {
+        TableAction::Preference(action) => preference::operation(action),
         TableAction::Resize(target) => (203, Some(target.count())),
         TableAction::Occupancy(SeatAction::Claim(seat)) => (204, Some(seat.get())),
         TableAction::Occupancy(SeatAction::Release) => (205, None),
@@ -238,7 +271,7 @@ fn operation(action: TableAction) -> (u32, Option<u8>) {
     }
 }
 fn action(bytes: &[u8]) -> io::Result<TableAction> {
-    for tag in [203, 204, 205, 206] {
+    for tag in [203, 204, 205, 206, 207, 208] {
         if let Ok(operation) = fields(bytes, &[tag]) {
             if tag == 205 {
                 fields(operation[&tag], &[])?;
@@ -248,6 +281,9 @@ fn action(bytes: &[u8]) -> io::Result<TableAction> {
             let &[value] = leaf[&1] else {
                 return Err(invalid("invalid lobby input"));
             };
+            if tag >= 207 {
+                return Ok(TableAction::Preference(preference::parse(tag, value)?));
+            }
             if tag == 203 {
                 return Ok(TableAction::Resize(
                     LobbyCapacity::new(value).ok_or(invalid("invalid lobby capacity"))?,
@@ -262,6 +298,24 @@ fn action(bytes: &[u8]) -> io::Result<TableAction> {
         }
     }
     Err(invalid("unrecognized seat operation"))
+}
+pub(crate) fn preference_actor(raw: &[u8]) -> Option<&[u8]> {
+    if raw.len() > 2048 {
+        return None;
+    }
+    let env = fields(raw, &[1, 2]).ok()?;
+    let body = fields(env[&1], &[1, 2, 3, 4, 5, 12]).ok()?;
+    matches!(action(body[&12]).ok()?, TableAction::Preference(_)).then_some(body[&3])
+}
+pub(crate) fn authenticated_member(
+    db: &Connection,
+    actor: &[u8],
+    peer: ReplicaId,
+) -> io::Result<()> {
+    if member(db, actor, u64::MAX)?.0 != peer {
+        return Err(invalid("incorrect command owner"));
+    }
+    Ok(())
 }
 pub(crate) fn is_seat_command(raw: &[u8]) -> bool {
     if raw.len() > 2048 {
@@ -327,7 +381,7 @@ impl SeatCommand {
             return Err(invalid("invalid observed layout revision"));
         }
         let (_, material) = action.evaluate(r, db, &state, body[&3], index)?;
-        let expected = SeatCommandGuard {
+        let mut expected = SeatCommandGuard {
             profile: r.profile().into(),
             session: r.session.clone(),
             actor: body[&3].into(),
@@ -336,7 +390,18 @@ impl SeatCommand {
             layout,
             action,
             material,
+            witness: None,
+            actor_proof: Vec::new(),
         };
+        if let TableAction::Preference(action) = action {
+            let proof = LobbyIntent(guard[&7].to_vec());
+            let (owner, id, op) = proof.authenticate_at(r, db, node, index)?;
+            if owner != body[&3] || id != request || op != action {
+                return Err(invalid("witness belongs to a different intent"));
+            }
+            expected.actor_proof = proof.0;
+            expected.verify_witness(db, index, &request, guard[&6])?;
+        }
         if guard != fields(&expected.guard(), tags)? {
             return Err(invalid("incorrect observed seat dependencies"));
         }
@@ -388,6 +453,7 @@ impl SeatCommand {
 pub struct LobbySeat {
     pub id: SeatId,
     pub occupant: Option<Vec<u8>>,
+    pub ready: bool,
     pub revision: u64,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -436,12 +502,14 @@ impl GameNode {
         request: [u8; 16],
         key: &SigningKey,
     ) -> io::Result<Signed> {
+        self.reserve_seat_command(guard.sign(request, key), request)
+    }
+    fn reserve_seat_command(&self, raw: Signed, request: [u8; 16]) -> io::Result<Signed> {
         let r = &self.replica;
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
         r.require_lobby_genesis(&tx)?;
         r.verify_replay(&tx)?;
-        let raw = guard.sign(request, key);
         let command = SeatCommand::verify(r, &tx, &raw.0)?;
         if r.local_node != Some(command.guard.node) {
             return Err(invalid("seat command belongs to another installation"));
@@ -549,7 +617,14 @@ impl GameNode {
         r.verify_replay(&db)?;
         member(&db, actor, u64::MAX)?;
         let state = layout_at(&db, u64::MAX)?;
-        let seats = Snapshot::at(r, &db, &state, u64::MAX)?.view();
+        let mut seats = Snapshot::at(r, &db, &state, u64::MAX)?.view();
+        if r.lobby_format == Some(lobby::LobbyFormat::DreamReady) {
+            for s in &mut seats {
+                if let Some(a) = &s.occupant {
+                    s.ready = preference::effective(&db, a, u64::MAX)?.ready;
+                }
+            }
+        }
         Ok(LobbySeatView {
             seats,
             setup_revision: setup_revision(&db)?,
@@ -609,6 +684,8 @@ impl GameNode {
             node,
             action,
             material,
+            witness: None,
+            actor_proof: Vec::new(),
         })
     }
 }
@@ -619,7 +696,7 @@ impl Replica {
         index: u64,
         revision: u64,
     ) -> io::Result<()> {
-        if self.lobby_format == Some(lobby::LobbyFormat::Resizable) {
+        if self.lobby_format.is_some_and(lobby::LobbyFormat::resizable) {
             db.execute(
                 "INSERT INTO setup_history(idx,revision) VALUES(?,?)",
                 params![index.to_be_bytes(), revision.to_be_bytes()],
@@ -642,7 +719,14 @@ impl Replica {
         if let Some(reply) = command.original(db)? {
             return Ok(Some(reply));
         }
-        if command.current(self, db)?.is_none() {
+        let current = command.current(self, db)?;
+        if matches!(
+            current,
+            Some(Change::Preference(preference::Transition::Unchanged))
+        ) {
+            return Ok(Some(Reply::AlreadyCurrent));
+        }
+        if current.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "seat dependencies changed",
@@ -671,13 +755,20 @@ impl Replica {
             .checked_add(1)
             .ok_or(invalid("receipt range"))?;
         let mut refs = Vec::new();
-        let (outcome, semantic) = if let Some(change) = command.current(self, db)? {
+        let current = command.current(self, db)?;
+        let (outcome, semantic) = if matches!(
+            current,
+            Some(Change::Preference(preference::Transition::Unchanged))
+        ) {
+            preference::unchanged(g)?
+        } else if let Some(change) = current {
             let effect::Effect {
                 record: effect,
                 facts,
             } = match change {
                 Change::Occupancy(action, tr) => effect::commit(self, db, k.index, g, action, tr)?,
-                Change::Resize(plan) => plan.commit(db, k.index, g.layout)?,
+                Change::Resize(plan) => plan.commit(self, db, k.index, g.layout)?,
+                Change::Preference(tr) => preference::commit(self, db, k.index, g, tr)?,
             };
             let (count, prev) = self.tip(db, "event")?;
             let seq = count.checked_add(1).ok_or(invalid("event range"))?;
@@ -703,10 +794,11 @@ impl Replica {
                 b"event-step/v2",
                 &prev,
                 &frame(&[
-                    if op == 203 {
-                        b"LobbyCapacityChanged/v1"
-                    } else {
-                        b"SeatChanged/v1"
+                    match op {
+                        203 => b"LobbyCapacityChanged/v1",
+                        207 => b"DreamSelected/v1",
+                        208 => b"ReadyChanged/v1",
+                        _ => b"SeatChanged/v1",
                     },
                     self.profile(),
                     &self.session,

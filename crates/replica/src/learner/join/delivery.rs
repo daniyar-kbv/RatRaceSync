@@ -33,7 +33,7 @@ impl InstallationCatalog {
                     let intent = parse(r, &raw)?;
                     if intent.admission != admission
                         || (intent.request != request
-                            && r.lobby_format != Some(lobby::LobbyFormat::Resizable))
+                            && r.lobby_format.is_none_or(|f| !f.resizable()))
                     {
                         return Err(invalid("another Join owns this reservation"));
                     }

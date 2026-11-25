@@ -1,5 +1,6 @@
 use super::*;
 mod delivery;
+pub(super) use delivery::elect_second;
 mod restart;
 
 impl Recovery {

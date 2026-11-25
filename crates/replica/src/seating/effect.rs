@@ -5,8 +5,7 @@ pub(super) struct Effect {
     pub(super) facts: Vec<u8>,
 }
 
-// Occupancy changes preserve the layout revision. Ready first becomes possible
-// in the profile that implements acknowledgments. Only actual occupancy changes advance setup.
+// An occupancy change advances setup and invalidates the actor's acknowledgment.
 pub(super) fn commit(
     r: &Replica,
     db: &Transaction<'_>,
@@ -20,11 +19,15 @@ pub(super) fn commit(
         .checked_add(1)
         .ok_or(invalid("setup revision overflow"))?;
     let layout = g.layout.to_be_bytes();
-    let ready = message(&[(1, &[0]), (2, &[0])]);
+    let prior_ready = [u8::from(
+        r.lobby_format == Some(lobby::LobbyFormat::DreamReady)
+            && preference::effective(db, &g.actor, index)?.ready,
+    )];
+    let ready = message(&[(1, &prior_ready), (2, &[0])]);
     let (source_revision, target_revision) = match &g.material {
         Dependencies::Occupancy(m) => (m.source_revision, m.target_revision),
         Dependencies::Legacy => (0, 0),
-        Dependencies::Resize(_) => return Err(invalid("expected occupancy dependencies")),
+        _ => return Err(invalid("expected occupancy dependencies")),
     };
     let mut numbers = vec![layout, layout];
     for (id, owner, prior) in [
@@ -104,7 +107,7 @@ pub(super) fn commit(
         }
     };
     facts.extend(numbers.iter().map(|n| n.as_slice()));
-    facts.extend([&[0][..], &[0][..]]);
+    facts.extend([&prior_ready[..], &[0][..]]);
     Ok(Effect {
         record,
         facts: frame(&facts),

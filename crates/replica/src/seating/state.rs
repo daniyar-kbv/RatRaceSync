@@ -56,6 +56,7 @@ impl Snapshot {
             .seats()
             .map(|(id, p)| LobbySeat {
                 id,
+                ready: false,
                 revision: self.revision(id),
                 occupant: p.map(|owner| owner.as_ref().to_vec()),
             })

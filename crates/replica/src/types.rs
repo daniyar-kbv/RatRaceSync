@@ -32,6 +32,7 @@ pub enum Reply {
     Protocol,
     Receipt(Vec<u8>),
     RequestIdConflict,
+    AlreadyCurrent,
 }
 /// Original payload bytes travel with the typed Raft entry, including genesis membership.
 #[derive(Clone, Debug, Serialize, Deserialize)]
