@@ -143,6 +143,13 @@ async fn check_restart(op: u16, conflict: bool) {
                     .query_row("SELECT count(*) FROM layout_history", [], |r| r.get(0))
                     .unwrap();
                 assert_eq!(layouts, i64::from(stage == 2 && !conflict));
+                if stage == 2 {
+                    // Reopen with the committed archive but without the outgoing local copy.
+                    let removed = db
+                        .execute("DELETE FROM meta WHERE name GLOB 'local_seat_claim_*'", [])
+                        .unwrap();
+                    assert_eq!(removed, 1);
+                }
             }
             let bytes: Vec<u8> = db
                 .query_row(

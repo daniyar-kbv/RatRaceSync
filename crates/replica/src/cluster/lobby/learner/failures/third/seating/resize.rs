@@ -175,3 +175,145 @@ async fn resized_lobby_recovers_on_a_third_installation_and_counts_unseated_memb
     r.third.shutdown().await.unwrap();
     r.p.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_allows_a_fresh_first_join_only_after_verified_layout_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Peers::with_profile(dir.path(), 3, LobbyFormat::Resizable).await;
+    p.finish().await;
+    let original = p
+        .catalog
+        .prepare_join(&p.learner, &p.identity, REQUEST, true)
+        .unwrap();
+    let fresh = request(93);
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, fresh, true)
+            .is_err()
+    );
+    let h = &p.game.node;
+    let resize = h
+        .player_count_guard(ACTOR, count(2))
+        .await
+        .unwrap()
+        .sign(request(92), &key());
+    h.submit(resize).await.unwrap();
+    assert!(h.join_lobby(&original).await.is_err());
+    let k = h.raft.metrics().borrow_watched().last_applied.unwrap();
+    p.learner
+        .node
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(k.index), "resize applied")
+        .await
+        .unwrap();
+    p.finish().await;
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, REQUEST, true)
+            .is_err()
+    );
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, fresh, false)
+            .is_err()
+    );
+    let pending = p
+        .catalog
+        .prepare_join(&p.learner, &p.identity, fresh, true)
+        .unwrap();
+    // Returning to the old capacity cannot make its retired request ID available again.
+    let host = &p.game.node;
+    let grow = host
+        .player_count_guard(ACTOR, count(3))
+        .await
+        .unwrap()
+        .sign(request(97), &key());
+    host.submit(grow).await.unwrap();
+    let k = host.raft.metrics().borrow_watched().last_applied.unwrap();
+    p.learner
+        .node
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(k.index), "second resize applied")
+        .await
+        .unwrap();
+    p.finish().await;
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, REQUEST, true)
+            .is_err()
+    );
+    assert_eq!(p.catalog.pending_join(&p.learner).unwrap(), pending);
+    let node = &p.game.node;
+    let joined = p
+        .catalog
+        .join_first_player(
+            &p.learner,
+            &p.identity,
+            request(98),
+            true,
+            async |raw| node.join_lobby(&raw).await,
+            async |q| node.answer_history_request(p.learner.id(), q, &key()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            joined.join.member.ordinal,
+            joined.join.member.layout_revision
+        ),
+        (2, 3)
+    );
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, REQUEST, true)
+            .is_err()
+    );
+    assert!(node.join_lobby(&original).await.is_err());
+    p.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_restores_success_and_conflict_by_id_without_a_local_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, _) =
+        finish_pair(Peers::with_profile(dir.path(), 3, LobbyFormat::Resizable).await).await;
+    let h = &p.game.node;
+    let a = h
+        .player_count_guard(ACTOR, count(2))
+        .await
+        .unwrap()
+        .sign(request(94), &key());
+    let b = h
+        .player_count_guard(ACTOR, count(4))
+        .await
+        .unwrap()
+        .sign(request(95), &key());
+    assert!(h.replica.preflight(&b).unwrap().is_none());
+    let won = h.submit(a.clone()).await.unwrap();
+    let lost = h.raft.client_write(b.clone()).await.unwrap().data;
+    for (id, raw, result) in [(94, a, won), (95, b, lost)] {
+        assert!(
+            h.saved_seat_command(ACTOR, request(id), &p.identity)
+                .is_err()
+        );
+        let saved = h
+            .saved_seat_command(ACTOR, request(id), &key())
+            .unwrap()
+            .expect("missing committed resize");
+        assert_eq!(saved.0, raw.0);
+        assert_eq!(h.submit(saved).await.unwrap(), result);
+    }
+    assert!(
+        h.saved_seat_command(ACTOR, request(96), &key())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.saved_seat_command(ACTOR, REQUEST, &key())
+            .unwrap()
+            .is_none()
+    );
+    p.shutdown().await;
+}

@@ -401,6 +401,22 @@ fn local_request_key(node: ReplicaId, request: [u8; 16]) -> String {
     format!("local_seat_claim_{node}_{}", u128::from_be_bytes(request))
 }
 
+// Callers have already replay-verified the receipt and its archived entry.
+fn archived_seat_command(db: &Connection, record: &[u8]) -> io::Result<Option<Signed>> {
+    let receipt = fields(record, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
+    let source: Vec<u8> = db
+        .query_row(
+            "SELECT source FROM archive WHERE log_id=?",
+            [receipt[&5]],
+            |row| row.get(0),
+        )
+        .map_err(io::Error::other)?;
+    Ok(source
+        .strip_prefix(&[1])
+        .filter(|raw| is_seat_command(raw))
+        .map(|raw| Signed(raw.to_vec())))
+}
+
 impl GameNode {
     pub fn prepare_seat_claim(
         &self,
@@ -446,20 +462,8 @@ impl GameNode {
         // A recovered installation may have the consensus history before it has a local
         // reservation. Preserve the original signed bytes even for alternate field order.
         let raw = if let Some(record) = committed {
-            let receipt = fields(&record, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
-            let source: Vec<u8> = tx
-                .query_row(
-                    "SELECT source FROM archive WHERE log_id=?",
-                    [receipt[&5]],
-                    |row| row.get(0),
-                )
-                .map_err(io::Error::other)?;
-            Signed(
-                source
-                    .strip_prefix(&[1])
-                    .ok_or(invalid("expected committed seat command"))?
-                    .to_vec(),
-            )
+            archived_seat_command(&tx, &record)?
+                .ok_or(invalid("expected committed seat command"))?
         } else {
             raw
         };
@@ -501,7 +505,23 @@ impl GameNode {
         if r.local_node != Some(node) || public != key.verifying_key().to_bytes() {
             return Err(invalid("incorrect local seat signer"));
         }
-        let saved = store::meta::<Signed>(&db, &local_request_key(node, request))?;
+        let saved = match store::meta::<Signed>(&db, &local_request_key(node, request))? {
+            Some(raw) => Some(raw),
+            None => {
+                let record: Option<Vec<u8>> = db
+                    .query_row(
+                        "SELECT record FROM receipt WHERE actor=? AND request=?",
+                        params![actor, request],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(io::Error::other)?;
+                match record {
+                    Some(record) => archived_seat_command(&db, &record)?,
+                    None => None,
+                }
+            }
+        };
         if let Some(raw) = &saved {
             let command = SeatCommand::verify(r, &db, &raw.0)?;
             command.committed_receipt(&db)?;

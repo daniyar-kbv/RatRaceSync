@@ -31,12 +31,18 @@ impl InstallationCatalog {
             for name in ["local_join", "third_proposal"] {
                 if let Some(raw) = store::meta::<Vec<u8>>(&db, name)? {
                     let intent = parse(r, &raw)?;
-                    if intent.request != request || intent.admission != admission {
+                    if intent.admission != admission
+                        || (intent.request != request
+                            && r.lobby_format != Some(lobby::LobbyFormat::Resizable))
+                    {
                         return Err(invalid("another Join owns this reservation"));
                     }
                 }
             }
-            store::meta::<Vec<u8>>(&db, "third_proposal")?
+            match store::meta::<Vec<u8>>(&db, "third_proposal")? {
+                Some(raw) if parse(r, &raw)?.request == request => Some(raw),
+                _ => None,
+            }
         };
         if let Some(raw) = previous {
             let checked = self.pending_join(learner)?;

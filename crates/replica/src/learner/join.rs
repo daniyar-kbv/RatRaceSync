@@ -154,6 +154,10 @@ pub(super) fn sealed_range(
     }
     Ok(sha.finalize().into())
 }
+fn retired_join_key(request: [u8; 16]) -> String {
+    format!("retired_join_{:032x}", u128::from_be_bytes(request))
+}
+
 impl InstallationCatalog {
     /// Normal adapter entry point for the first additional player. Both
     /// exchanges use already authenticated peer transports. Repeating this
@@ -231,30 +235,75 @@ impl InstallationCatalog {
             return Err(invalid("incorrect admission for this Join"));
         }
         let saved = store::meta::<Vec<u8>>(&tx, "local_join")?;
-        if let Some(raw) = &saved {
-            let original = parse(r, raw)?;
-            if original.request != request {
-                return Err(invalid("another Join owns this reservation"));
-            }
-            if store::meta::<JoinedMember>(
-                &tx,
-                if third_player {
-                    "third_member"
-                } else {
-                    "first_member"
-                },
-            )?
-            .is_some()
+        let previous = saved.as_deref().map(|raw| parse(r, raw)).transpose()?;
+        let promotion = store::meta::<Vec<u8>>(&tx, "third_proposal")?;
+        if let Some(approved) = &promotion {
+            let approved = parse(r, approved)?;
+            if !third_player
+                || previous
+                    .as_ref()
+                    .is_none_or(|draft| draft.fingerprint != approved.fingerprint)
             {
+                return Err(invalid("promotion lacks its matching reserved intent"));
+            }
+            approved.verify_approvals(&tx, &learner.creator, 3)?;
+        }
+        let occupied = store::meta::<JoinedMember>(
+            &tx,
+            if third_player {
+                "third_member"
+            } else {
+                "first_member"
+            },
+        )?
+        .is_some();
+        if let (Some(raw), Some(original)) = (&saved, &previous) {
+            if original.admission != admission {
+                return Err(invalid("unexpected reserved Join identity"));
+            }
+            if occupied {
+                if original.request != request {
+                    return Err(invalid("another Join owns this reservation"));
+                }
                 return Ok(raw.clone());
             }
-        } else if !profile_complete {
+        }
+        let replacing = previous.as_ref().is_some_and(|old| old.request != request);
+        if (previous.is_none() || replacing) && !profile_complete {
             return Err(invalid("complete local profile required"));
         }
         if history::boundary(&tx)? != verified {
             return Err(invalid("refresh verified learner prefix"));
         }
-        let lobby = seating::layout_at(&tx, u64::MAX)?;
+        let lobby = seating::layout_at(&tx, verified.index)?;
+        if r.lobby_format == Some(lobby::LobbyFormat::Resizable) {
+            if store::meta::<Vec<u8>>(&tx, &retired_join_key(request))?.is_some() {
+                return Err(invalid("obsolete Join request"));
+            }
+            if third_player && lobby.seats.capacity().count() < 3 {
+                return Err(invalid("no open place for an additional player"));
+            }
+        }
+        if let Some(old) = previous.as_ref().filter(|_| replacing) {
+            // This certified prefix contains a later layout and no admission of this player.
+            // LastLogId and the signed layout guard fence every delivery of the prior intent.
+            if r.lobby_format != Some(lobby::LobbyFormat::Resizable)
+                || old.layout >= lobby.layout_revision
+                || original_join(&tx, old)?.is_some()
+            {
+                return Err(invalid("another Join owns this reservation"));
+            }
+            let old_raw = saved.as_deref().ok_or(invalid("missing reserved Join"))?;
+            if promotion.is_some() {
+                tx.execute("DELETE FROM meta WHERE name='third_proposal'", [])
+                    .map_err(io::Error::other)?;
+            }
+            store::put(
+                &tx,
+                &retired_join_key(old.request),
+                &promotion.as_deref().unwrap_or(old_raw),
+            )?;
+        }
         let m = history::membership(&tx)?;
         let membership = log_key(m.log_id().ok_or(invalid("missing membership source"))?);
         let setup = seating::setup_revision(&tx)?.to_be_bytes();
@@ -300,9 +349,7 @@ impl InstallationCatalog {
         );
         let raw = message(&[(1, &intent), (2, &witness)]);
         let checked = parse(r, &raw)?;
-        if let Some(saved) = saved
-            && parse(r, &saved)?.fingerprint != checked.fingerprint
-        {
+        if !replacing && previous.is_some_and(|old| old.fingerprint != checked.fingerprint) {
             return Err(invalid("original Join guard changed"));
         }
         store::put(&tx, "local_join", &raw)?;

@@ -47,6 +47,46 @@ async fn stale_prefix_refresh_preserves_original_request_and_retry_skips_old_vot
     r.recover().await;
     let initial = r.proposal().await.unwrap();
     let first = fields(&initial, &[1, 2, 3, 4]).unwrap()[&1].to_vec();
+    elect_second(&r).await;
+    let host = &r.p.game.node;
+    let second = &r.p.learner.node;
+    assert_eq!(
+        second.join_lobby(&initial).await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let mut network = Transport {
+        host,
+        second,
+        second_key: &r.p.identity,
+        third: r.third.id(),
+        refreshed: 0,
+        dropped: false,
+    };
+    let err = r
+        .catalog
+        .join_third_player(&mut r.third, &r.identity, REQUEST, true, &mut network)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    assert!(network.refreshed > 0);
+    let raw = r.catalog.pending_join(&r.third).unwrap();
+    assert_eq!(fields(&raw, &[1, 2, 3, 4]).unwrap()[&1], first);
+    assert_ne!(initial, raw);
+    let count = network.refreshed;
+    let delivered = r
+        .catalog
+        .join_third_player(&mut r.third, &r.identity, REQUEST, true, &mut network)
+        .await
+        .unwrap();
+    delivered.history.unwrap();
+    assert_eq!(delivered.join, second.join_lobby(&initial).await.unwrap());
+    assert_eq!(count, network.refreshed);
+    r.third.shutdown().await.unwrap();
+    r.p.shutdown().await;
+}
+
+async fn elect_second(r: &Recovery) {
     let host = &r.p.game.node;
     let second = &r.p.learner.node;
     host.raft.runtime_config().elect(false);
@@ -80,38 +120,89 @@ async fn stale_prefix_refresh_preserves_original_request_and_retry_skips_old_vot
         })
         .await
         .unwrap();
-    assert_eq!(
-        second.join_lobby(&initial).await.unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resize_allows_a_fresh_third_join_after_election_without_reusing_stale_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair =
+        finish_pair(Peers::with_profile(dir.path(), 3, crate::lobby::LobbyFormat::Resizable).await)
+            .await;
+    let mut r = admit_to_pair(dir.path(), pair).await;
+    r.recover().await;
+    let stale = r.proposal().await.unwrap();
+    // A retained promotion can still be delivered even if the local draft was lost.
+    let draft = {
+        let db = r.third.node.replica.lock().unwrap();
+        let bytes = store::meta::<Vec<u8>>(&db, "local_join").unwrap().unwrap();
+        db.execute("DELETE FROM meta WHERE name='local_join'", [])
+            .unwrap();
+        bytes
+    };
+    let mut different = REQUEST;
+    different[15] ^= 19;
+    let orphan_retry = r
+        .catalog
+        .prepare_third_join(&r.third, &r.identity, different, true, async |_, _| {
+            Err(invalid("unexpected capability exchange"))
+        })
+        .await;
+    assert!(orphan_retry.is_err());
+    {
+        let db = r.third.node.replica.lock().unwrap();
+        assert!(
+            store::meta::<Vec<u8>>(&db, "local_join").unwrap().is_none(),
+            "unresolved promotion was rebound"
+        );
+        assert_eq!(
+            store::meta::<Vec<u8>>(&db, "third_proposal")
+                .unwrap()
+                .unwrap(),
+            stale
+        );
+        store::put(&db, "local_join", &draft).unwrap();
+    }
+    let host = &r.p.game.node;
+    let guard = host
+        .player_count_guard(ACTOR, rat_race_engine::LobbyCapacity::new(4).unwrap())
+        .await
+        .unwrap();
+    let mut resize_id = REQUEST;
+    resize_id[15] ^= 17;
+    host.submit(guard.sign(resize_id, &key())).await.unwrap();
+    assert!(host.join_lobby(&stale).await.is_err());
+    elect_second(&r).await;
+    let mut fresh = REQUEST;
+    fresh[15] ^= 13;
     let mut network = Transport {
         host,
-        second,
+        second: &r.p.learner.node,
         second_key: &r.p.identity,
         third: r.third.id(),
         refreshed: 0,
-        dropped: false,
+        dropped: true,
     };
-    let err = r
-        .catalog
-        .join_third_player(&mut r.third, &r.identity, REQUEST, true, &mut network)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
-    assert!(network.refreshed > 0);
-    let raw = r.catalog.pending_join(&r.third).unwrap();
-    assert_eq!(fields(&raw, &[1, 2, 3, 4]).unwrap()[&1], first);
-    assert_ne!(initial, raw);
-    let count = network.refreshed;
     let delivered = r
         .catalog
-        .join_third_player(&mut r.third, &r.identity, REQUEST, true, &mut network)
+        .join_third_player(&mut r.third, &r.identity, fresh, true, &mut network)
         .await
         .unwrap();
     delivered.history.unwrap();
-    assert_eq!(delivered.join, second.join_lobby(&initial).await.unwrap());
-    assert_eq!(count, network.refreshed);
+    assert_eq!(
+        (
+            delivered.join.member.ordinal,
+            delivered.join.member.layout_revision
+        ),
+        (3, 2)
+    );
+    assert_ne!(r.catalog.pending_join(&r.third).unwrap(), stale);
+    assert!(network.second.join_lobby(&stale).await.is_err());
+    let same = r
+        .catalog
+        .join_third_player(&mut r.third, &r.identity, fresh, true, &mut network)
+        .await
+        .unwrap();
+    assert_eq!(same.join, delivered.join);
     r.third.shutdown().await.unwrap();
     r.p.shutdown().await;
 }
