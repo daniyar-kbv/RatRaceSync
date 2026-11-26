@@ -132,6 +132,8 @@ impl RecoveryRoute {
                 };
                 e.payload.join_command()?.is_none()
                     && m == Members::new_with_defaults(vec![[creator].into()], learners)
+            } else if m == join::target(creator, self.learner) {
+                e.payload.join_command()?.is_some()
             } else if m.voter_ids().count() == 3 {
                 // The receiver verifies the complete signed promotion before this check.
                 e.payload.join_command()?.is_some()

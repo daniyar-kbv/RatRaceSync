@@ -23,6 +23,7 @@ impl Intent<'_> {
         ordinal: u32,
     ) -> io::Result<()> {
         match (ordinal, self.approvals) {
+            (3, None) if self.recovery_route.is_some() => Ok(()),
             (2, None) => Ok(()),
             (3, Some([a, b])) => {
                 let second = store::meta::<JoinedMember>(db, "first_member")?
@@ -65,7 +66,7 @@ impl GameNode {
                     (Some(route.joined), route.joined_key),
                 ]
                 .contains(&(r.local_node, key.verifying_key().to_bytes()))
-                || intent.validate(&db, &creator)?.ordinal != 3
+                || intent.validate(r, &db, &creator)?.ordinal != 3
             {
                 return Err(invalid("unexpected third promotion request"));
             }
@@ -128,7 +129,8 @@ impl Replica {
                 continue;
             }
             if leaving
-                || seating::departure::left_at(db, applied.index)?.is_some()
+                || (seating::departure::left_at(db, applied.index)?.is_some()
+                    && entry.payload.join_command()?.is_none())
                 || promoted
                 || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?
                     != entry.log_id.index.to_be_bytes()
@@ -171,11 +173,12 @@ impl Replica {
             }
             return Ok(());
         }
-        let change = intent.validate(db, &creator)?;
+        let change = intent.validate(self, db, &creator)?;
         let prev = store::meta::<LogId>(db, "applied")?.ok_or(invalid("missing predecessor"))?;
         let second = store::meta::<JoinedMember>(db, "first_member")?
             .ok_or(invalid("missing predecessor voter"))?;
-        if ![creator.node, second.node].contains(&e.log_id.leader_id.node_id)
+        if (intent.recovery_route.is_some() && e.log_id.leader_id.node_id != creator.node)
+            || ![creator.node, second.node].contains(&e.log_id.leader_id.node_id)
             || e.log_id.leader_id != prev.leader_id
             || change.ordinal != 3
             || e.payload.check_members()? != Some(change.target)
@@ -185,12 +188,18 @@ impl Replica {
             return Err(invalid("unexpected third voter configuration"));
         }
         if self.local_node == Some(intent.node) {
-            let saved = store::meta::<Vec<u8>>(db, "third_proposal")?
+            let slot = if intent.recovery_route.is_some() {
+                "local_join"
+            } else {
+                "third_proposal"
+            };
+            let saved = store::meta::<Vec<u8>>(db, slot)?
                 .ok_or(invalid("missing local promotion consent"))?;
             let approved = parse(self, &saved)?;
             if intent.fingerprint != approved.fingerprint
                 || intent.prefix != approved.prefix
                 || intent.sealed != approved.sealed
+                || intent.recovery_route != approved.recovery_route
             {
                 return Err(invalid("wrong local Join intent"));
             }

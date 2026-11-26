@@ -658,6 +658,8 @@ async fn last_guest_registered_learner_resumes_from_creator_alone() {
     host.raft.shutdown().await.unwrap();
 }
 
+mod replacement;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn last_guest_cannot_sign_a_prepared_promotion_after_release() {
     let root = tempfile::tempdir().unwrap();

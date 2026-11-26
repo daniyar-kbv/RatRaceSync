@@ -10,7 +10,7 @@ use crate::{
     application::ReceiptRecord,
     lobby::{frame, persist_link},
 };
-use openraft::{entry::RaftPayload, raft::Precondition};
+use openraft::{entry::RaftPayload, raft::Precondition, type_config::TypeConfigExt};
 use serde::{Deserialize, Serialize};
 
 const WITNESS: &[u8] = b"RatRaceSync/verified-join-prefix/v1";
@@ -40,6 +40,8 @@ pub struct JoinDelivery {
 }
 
 struct Intent<'a> {
+    // Present only in the learner-signed witness for a Join from the post-Leave singleton.
+    recovery_route: Option<&'a [u8]>,
     approvals: Option<[&'a [u8]; 2]>,
     actor: &'a [u8],
     key: [u8; 32],
@@ -107,7 +109,9 @@ fn parse<'a>(r: &Replica, raw: &'a [u8]) -> io::Result<Intent<'a>> {
             &202u16.to_be_bytes(),
         ],
     );
-    let witness = fields(authenticate(outer[&2], &key)?, &[1, 2, 3, 4])?;
+    let signed_witness = authenticate(outer[&2], &key)?;
+    let witness = fields(signed_witness, &[1, 2, 3, 4])
+        .or_else(|_| fields(signed_witness, &[1, 2, 3, 4, 5]))?;
     if membership.len() != 32
         || witness[&1] != WITNESS
         || witness[&2] != fp
@@ -117,6 +121,7 @@ fn parse<'a>(r: &Replica, raw: &'a [u8]) -> io::Result<Intent<'a>> {
         return Err(invalid("invalid verified Join prefix witness"));
     }
     Ok(Intent {
+        recovery_route: witness.get(&5).copied(),
         approvals: outer.get(&3).map(|a| [*a, outer[&4]]),
         actor,
         key,
@@ -159,7 +164,7 @@ fn retired_join_key(request: [u8; 16]) -> String {
 }
 
 impl InstallationCatalog {
-    /// Normal adapter entry point for the first additional player. Both
+    /// Deliver Join when the creator is the sole voter, including after a departure. Both
     /// exchanges use already authenticated peer transports. Repeating this
     /// operation after a disconnect reuses the durable player request.
     pub async fn join_first_player(
@@ -231,7 +236,10 @@ impl InstallationCatalog {
         let r = &learner.node.replica;
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
-        if third::local_route(r, &tx)?.is_some() != third_player {
+        let routed = third::local_route(r, &tx)?.is_some();
+        let replacement =
+            routed && seating::departure::last_guest_at(&tx, verified.index)?.is_some();
+        if (routed && !replacement) != third_player {
             return Err(invalid("incorrect admission for this Join"));
         }
         let saved = store::meta::<Vec<u8>>(&tx, "local_join")?;
@@ -239,7 +247,7 @@ impl InstallationCatalog {
         let promotion = store::meta::<Vec<u8>>(&tx, "third_proposal")?;
         if let Some(approved) = &promotion {
             let approved = parse(r, approved)?;
-            if !third_player
+            if !(third_player || replacement)
                 || previous
                     .as_ref()
                     .is_none_or(|draft| draft.fingerprint != approved.fingerprint)
@@ -250,7 +258,7 @@ impl InstallationCatalog {
         }
         let occupied = store::meta::<JoinedMember>(
             &tx,
-            if third_player {
+            if routed {
                 "third_member"
             } else {
                 "first_member"
@@ -285,10 +293,13 @@ impl InstallationCatalog {
             }
         }
         if let Some(old) = previous.as_ref().filter(|_| replacing) {
-            // This certified prefix contains a later layout and no admission of this player.
-            // LastLogId and the signed layout guard fence every delivery of the prior intent.
+            // A later layout or the registered voter's departure invalidates the old guard.
+            // The original request remains retired once the new intent takes its place.
             if r.lobby_format.is_none_or(|f| !f.resizable())
-                || old.layout >= lobby.layout_revision
+                || (old.layout >= lobby.layout_revision
+                    && !(replacement
+                        && old.recovery_route.is_none()
+                        && old.setup < seating::setup_revision(&tx)?))
                 || original_join(&tx, old)?.is_some()
             {
                 return Err(invalid("another Join owns this reservation"));
@@ -338,15 +349,18 @@ impl InstallationCatalog {
             ],
         );
         let coverage = sealed_range(r, &tx, &learner.creator.key, verified)?;
-        let witness = signed(
-            &message(&[
-                (1, WITNESS),
-                (2, &fp),
-                (3, &log_key(verified)),
-                (4, &coverage),
-            ]),
-            key,
-        );
+        let mut witness = message(&[
+            (1, WITNESS),
+            (2, &fp),
+            (3, &log_key(verified)),
+            (4, &coverage),
+        ]);
+        if replacement {
+            let route = store::meta::<Vec<u8>>(&tx, "local_recovery_route")?
+                .ok_or(invalid("missing recovery route"))?;
+            wire::field(&mut witness, 5, &route);
+        }
+        let witness = signed(&witness, key);
         let raw = message(&[(1, &intent), (2, &witness)]);
         let checked = parse(r, &raw)?;
         if !replacing && previous.is_some_and(|old| old.fingerprint != checked.fingerprint) {
@@ -359,18 +373,26 @@ impl InstallationCatalog {
     pub fn pending_join(&self, learner: &Learner) -> io::Result<Vec<u8>> {
         self.verified_join_prefix(learner)?;
         let db = learner.node.replica.lock()?;
-        let third = third::local_route(&learner.node.replica, &db)?.is_some();
-        let raw = store::meta::<Vec<u8>>(
-            &db,
-            if third {
-                "third_proposal"
-            } else {
-                "local_join"
-            },
-        )?
-        .ok_or(invalid("no pending Join"))?;
-        let intent = parse(&learner.node.replica, &raw)?;
-        intent.verify_approvals(&db, &learner.creator, if third { 3 } else { 2 })?;
+        learner
+            .saved_proposal(&db)?
+            .ok_or(invalid("no pending Join"))
+    }
+}
+impl Learner {
+    fn saved_proposal(&self, db: &Connection) -> io::Result<Option<Vec<u8>>> {
+        let r = &self.node.replica;
+        let draft = store::meta::<Vec<u8>>(db, "local_join")?;
+        let route = third::local_route(r, db)?;
+        let raw = match (route.as_ref(), draft.as_ref()) {
+            (Some(_), Some(raw)) if parse(r, raw)?.recovery_route.is_none() => {
+                store::meta(db, "third_proposal")?
+            }
+            _ => draft,
+        };
+        if let Some(raw) = &raw {
+            let intent = parse(r, raw)?;
+            intent.verify_approvals(db, &self.creator, if route.is_some() { 3 } else { 2 })?;
+        }
         Ok(raw)
     }
 }
@@ -380,7 +402,7 @@ pub(super) fn target(creator: ReplicaId, peer: ReplicaId) -> Members {
 }
 
 impl Intent<'_> {
-    fn validate(&self, db: &Connection, creator: &Creator) -> io::Result<Transition> {
+    fn validate(&self, r: &Replica, db: &Connection, creator: &Creator) -> io::Result<Transition> {
         let prev = history::membership(db)?;
         let prior = prev
             .log_id()
@@ -395,13 +417,38 @@ impl Intent<'_> {
             {
                 return Err(invalid("occupied third player identity or slot"));
             }
-            (
-                target(creator.node, member.node),
-                promotion::roster(creator.node, member.node, self.node),
-                3,
-                "third_member",
-            )
+            if let Some(raw) = self.recovery_route {
+                // Keep the first guest's binding and ordinal in history. Only the creator
+                // and the registered learner belong to the successor voting configuration.
+                let route = third::RecoveryRoute::parse(r, creator, raw)?;
+                route.verify_historical_join(r, db, member.log_id)?;
+                let departure = seating::departure::last_guest_at(db, u64::MAX)?
+                    .ok_or(invalid("missing singleton departure"))?;
+                if departure.node != member.node
+                    || prior != departure.log_id
+                    || route.admission != self.admission
+                    || self.approvals.is_some()
+                {
+                    return Err(invalid("invalid post-departure admission"));
+                }
+                (
+                    Members::new_with_defaults(vec![[creator.node].into()], []),
+                    target(creator.node, self.node),
+                    3,
+                    "third_member",
+                )
+            } else {
+                (
+                    target(creator.node, member.node),
+                    promotion::roster(creator.node, member.node, self.node),
+                    3,
+                    "third_member",
+                )
+            }
         } else {
+            if self.recovery_route.is_some() {
+                return Err(invalid("unexpected post-departure admission"));
+            }
             (
                 Members::new_with_defaults(vec![[creator.node].into()], []),
                 target(creator.node, self.node),
@@ -418,7 +465,7 @@ impl Intent<'_> {
             || self.membership != log_key(prior)
             || self.setup != seating::setup_revision(db)?
             || self.layout != lobby.layout_revision
-            || u32::from(lobby.seats.capacity().count()) < ordinal
+            || usize::from(lobby.seats.capacity().count()) < target.voter_ids().count()
         {
             return Err(invalid("stale or ineligible Join"));
         }
@@ -442,6 +489,9 @@ impl GameNode {
     pub async fn join_lobby(&self, raw: &[u8]) -> io::Result<JoinResult> {
         let r = &self.replica;
         let intent = parse(r, raw)?;
+        let permit = self
+            .lock_request((intent.actor.to_vec(), intent.request))
+            .await?;
         self.raft
             .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
             .await
@@ -455,9 +505,16 @@ impl GameNode {
             }
             let creator =
                 store::meta::<Creator>(&db, "creator")?.ok_or(invalid("missing creator"))?;
-            let change = intent.validate(&db, &creator)?;
+            let change = intent.validate(r, &db, &creator)?;
             intent.verify_approvals(&db, &creator, change.ordinal)?;
             let high = history::boundary(&db)?;
+            if let Some(route) = intent.recovery_route {
+                let saved =
+                    store::meta::<Vec<u8>>(&db, &format!("issued_recovery_route_{}", intent.node))?;
+                if r.local_node != Some(creator.node) || saved.as_deref() != Some(route) {
+                    return Err(invalid("unrecognized registered learner"));
+                }
+            }
             if change.ordinal == 3 && intent.prefix != log_key(high) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -475,11 +532,16 @@ impl GameNode {
             }
             (high, change.prior, change.target)
         };
-        let response = self
-            .raft
-            .append_membership(
+        if intent.recovery_route.is_some() && !self.voting_history_complete(high)? {
+            return Err(invalid("predecessor history handoff pending"));
+        }
+        let raft = self.raft.clone();
+        let source = Source::blank().with_normal(Signed(raw.to_vec()));
+        let response = Types::spawn(async move {
+            let _permit = permit;
+            raft.append_membership(
                 members,
-                Source::blank().with_normal(Signed(raw.to_vec())),
+                source,
                 [
                     Precondition::CommittedLeaderId {
                         committed_leader_id: high.leader_id,
@@ -493,7 +555,10 @@ impl GameNode {
                 ],
             )
             .await
-            .map_err(io::Error::other)?;
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
         let db = r.lock()?;
         let result = original_join(&db, &intent)?.ok_or(invalid("missing applied Join"))?;
         if response.log_id != result.log_id
@@ -613,11 +678,12 @@ impl Replica {
     ) -> io::Result<Vec<u8>> {
         let command = parse(self, raw)?;
         let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-        let change = command.validate(db, &creator)?;
+        let change = command.validate(self, db, &creator)?;
         command.verify_approvals(db, &creator, change.ordinal)?;
         let prior = change.prior;
         let prev = store::meta::<LogId>(db, "applied")?.ok_or(invalid("no verified prefix"))?;
-        if k.leader_id != prev.leader_id
+        if (command.recovery_route.is_some() && k.leader_id.node_id != creator.node)
+            || k.leader_id != prev.leader_id
             || command.prefix != log_key(prev)
             || m != &change.target
             || original_join(db, &command)?.is_some()

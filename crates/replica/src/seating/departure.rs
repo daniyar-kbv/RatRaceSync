@@ -38,12 +38,21 @@ pub(crate) fn reject_departed(
 }
 
 pub(crate) fn last_guest_at(db: &Connection, index: u64) -> io::Result<Option<Departure>> {
-    Ok(store::meta::<Departure>(db, "last_guest_departure")?.filter(|d| d.log_id.index <= index))
+    for slot in ["replacement_departure", "last_guest_departure"] {
+        if let Some(d) = store::meta::<Departure>(db, slot)?.filter(|d| d.log_id.index <= index) {
+            return Ok(Some(d));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn departures_at(db: &Connection, index: u64) -> io::Result<Vec<Departure>> {
     let mut departures = Vec::new();
-    for name in ["departed_member", "last_guest_departure"] {
+    for name in [
+        "departed_member",
+        "last_guest_departure",
+        "replacement_departure",
+    ] {
         if let Some(d) = store::meta::<Departure>(db, name)?.filter(|d| d.log_id.index <= index) {
             departures.push(d);
         }
@@ -370,7 +379,9 @@ pub(super) fn commit(
     r.advance_setup(db, k.index, outcome.setup)?;
     store::put(
         db,
-        if successors(db, &g.actor, k.index - 1)?.len() == 1 {
+        if last_guest_at(db, k.index - 1)?.is_some() {
+            "replacement_departure"
+        } else if successors(db, &g.actor, k.index - 1)?.len() == 1 {
             "last_guest_departure"
         } else {
             "departed_member"

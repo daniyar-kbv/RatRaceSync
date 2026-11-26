@@ -20,6 +20,12 @@ impl Replica {
             let creator = store::meta::<crate::genesis::Creator>(db, "creator")?
                 .ok_or(invalid("missing lobby creator"))?;
             store::put(&replay, "creator", &creator)?;
+            if self.lobby_format == Some(crate::lobby::LobbyFormat::LastGuest)
+                && let Some(genesis) =
+                    store::meta::<crate::genesis::SignedGenesis>(db, "signed_genesis")?
+            {
+                store::put(&replay, "signed_genesis", &genesis)?;
+            }
         } else {
             seed_opening_state(db, &replay)?;
         }
@@ -32,12 +38,21 @@ impl Replica {
                 .map_err(io::Error::other)?;
             while let Some(row) = rows.next().map_err(io::Error::other)? {
                 let idx: [u8; 8] = row.get(0).map_err(io::Error::other)?;
-                let entry: Entry = store::decode(
-                    row.get_ref(1)
-                        .map_err(io::Error::other)?
-                        .as_blob()
-                        .map_err(io::Error::other)?,
-                )?;
+                let bytes = row
+                    .get_ref(1)
+                    .map_err(io::Error::other)?
+                    .as_blob()
+                    .map_err(io::Error::other)?;
+                let entry: Entry = store::decode(bytes)?;
+                // A replacement Join carries the original registration certificate. Replay
+                // needs its exact historical membership entries to check that certificate.
+                if self.lobby_format == Some(crate::lobby::LobbyFormat::LastGuest)
+                    && entry.payload.check_members()?.is_some()
+                {
+                    replay
+                        .execute("INSERT INTO raft_log VALUES(?,?)", params![idx, bytes])
+                        .map_err(io::Error::other)?;
+                }
                 if entry.log_id.index.to_be_bytes() != idx {
                     return Err(invalid("raft log index mismatch"));
                 }
@@ -50,7 +65,7 @@ impl Replica {
             "SELECT * FROM receipt ORDER BY seq",
             "SELECT * FROM participant ORDER BY actor",
             "SELECT * FROM certificate ORDER BY actor,position",
-            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby','finance_open','first_member','third_member','seat_claims','setup_revision','cancelled_at','departed_member','last_guest_departure') ORDER BY name",
+            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby','finance_open','first_member','third_member','seat_claims','setup_revision','cancelled_at','departed_member','last_guest_departure','replacement_departure') ORDER BY name",
         ] {
             if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
                 return Err(invalid(

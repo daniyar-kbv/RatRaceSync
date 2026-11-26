@@ -129,7 +129,7 @@ impl Replica {
         self.verify_local_promotion(raw, &entry.payload)?;
         let db = self.lock()?;
         let intent = parse(self, raw)?;
-        intent.validate(&db, &creator)?;
+        intent.validate(self, &db, &creator)?;
         let prev = history::boundary(&db)?;
         if log_key(prev) != intent.prefix || prev.index.checked_add(1) != Some(entry.log_id.index) {
             return Err(invalid("candidate Join does not extend verified prefix"));

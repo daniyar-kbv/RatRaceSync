@@ -1,6 +1,6 @@
 use super::*;
 
-/// Adapter for the authenticated peer exchanges used to join a two-voter lobby.
+/// Authenticated peer exchanges for a learner originally registered by two voters.
 /// A stale verified prefix is reported by the leader as `WouldBlock`.
 #[allow(async_fn_in_trait)]
 pub trait ThirdJoinTransport {
@@ -39,7 +39,7 @@ impl InstallationCatalog {
                     }
                 }
             }
-            match store::meta::<Vec<u8>>(&db, "third_proposal")? {
+            match learner.saved_proposal(&db)? {
                 Some(raw) if parse(r, &raw)?.request == request => Some(raw),
                 _ => None,
             }
@@ -63,15 +63,21 @@ impl InstallationCatalog {
         }
         self.recover_learner(learner, key, async |q| network.recover(q).await)
             .await?;
-        let raw = self
-            .prepare_third_join(
+        let high = self.verified_join_prefix(learner)?;
+        let sole = seating::departure::last_guest_at(&*learner.node.replica.lock()?, high.index)?
+            .is_some();
+        let raw = if sole {
+            self.prepare_join(learner, key, request, profile_complete)?
+        } else {
+            self.prepare_third_join(
                 learner,
                 key,
                 request,
                 profile_complete,
                 async |draft, route| network.confirm(draft, route).await,
             )
-            .await?;
+            .await?
+        };
         let reply = network.submit(raw.clone()).await?;
         self.finish_join(learner, key, &raw, reply, async |q| {
             network.history(q).await

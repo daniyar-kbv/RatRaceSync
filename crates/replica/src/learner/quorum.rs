@@ -77,7 +77,12 @@ impl GameNode {
         mut exchange: impl AsyncFnMut(VotingHistoryRequest) -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
         let last_guest = seating::departure::last_guest_at(&*self.replica.lock()?, k.index)?;
-        if let Some(departure) = last_guest {
+        let third = history::third_at(&*self.replica.lock()?, k.index)?;
+        if let Some(departure) = last_guest
+            && third
+                .as_ref()
+                .is_none_or(|m| m.log_id.index < departure.log_id.index)
+        {
             // Verify the requested full LogId before writing any part of its range.
             {
                 let db = self.replica.lock()?;
@@ -98,7 +103,6 @@ impl GameNode {
             }
             return Ok(());
         }
-        let third = history::third_at(&*self.replica.lock()?, k.index)?;
         if let Some(m) = third {
             return self.reconcile_bundle(m.log_id, k, key, exchange).await;
         }

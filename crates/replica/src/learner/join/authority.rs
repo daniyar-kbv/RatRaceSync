@@ -111,7 +111,11 @@ impl PromotionAuthority {
             .borrow_watched()
             .membership_config
             .clone();
-        if config.membership().voter_ids().count() != 3 {
+        let voters = config.membership().voter_ids().count();
+        if voters != 3
+            && !(voters == 2
+                && seating::departure::last_guest_at(&*self.replica.lock()?, u64::MAX)?.is_some())
+        {
             return Ok(None);
         }
         let k = config
@@ -125,6 +129,16 @@ impl PromotionAuthority {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             ).map_err(io::Error::other)?;
         let entry = store::decode::<Entry>(&bytes)?;
+        if voters == 2
+            && !entry
+                .payload
+                .join_command()?
+                .map(|raw| parse(r, raw))
+                .transpose()?
+                .is_some_and(|intent| intent.recovery_route.is_some())
+        {
+            return Ok(None);
+        }
         if r.local_node != Some(sender)
             || entry.log_id != k
             || entry.payload.check_members()?.as_ref() != Some(config.membership())

@@ -261,9 +261,18 @@ impl LearnerReplication {
                 )?;
                 continue;
             }
+            let replacement = route
+                .as_ref()
+                .is_some_and(|route| entry.log_id.index > route.join.index)
+                && entry.payload.join_command()?.is_some()
+                && entry
+                    .payload
+                    .check_members()?
+                    .is_some_and(|m| m == join::target(self.creator, self.local));
             if third
                 .as_ref()
                 .is_some_and(|m| entry.log_id.index >= m.log_id.index)
+                && !replacement
                 && entry
                     .payload
                     .check_members()?
@@ -271,10 +280,11 @@ impl LearnerReplication {
             {
                 return Err(invalid("unexpected change after third Join"));
             }
-            if entry
-                .payload
-                .check_members()?
-                .is_some_and(|m| m.voter_ids().count() == 3)
+            if replacement
+                || entry
+                    .payload
+                    .check_members()?
+                    .is_some_and(|m| m.voter_ids().count() == 3)
             {
                 self.replica.verify_third_entry(entry)?;
             }

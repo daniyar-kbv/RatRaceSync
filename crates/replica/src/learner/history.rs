@@ -37,26 +37,30 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                 .ok_or(invalid("invalid historical membership"))?;
             let creator =
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-            let valid = if let Some(d) = seating::departure::left_at(db, entry.log_id.index)? {
+            let valid = if seating::departure::left_at(db, entry.log_id.index)?
+                .is_some_and(|d| d.log_id == entry.log_id)
+            {
                 let voters = super::quorum::voters(db, entry.log_id.index)?;
                 let prior = membership_entry(db, entry.log_id.index, false)?
                     .ok_or(invalid("missing Leave predecessor"))?
                     .payload
                     .check_members()?
                     .ok_or(invalid("invalid Leave predecessor"))?;
-                entry.log_id == d.log_id
-                    && entry.payload.leave_source()?.is_some()
+                entry.payload.leave_source()?.is_some()
                     && members
                         == Members::new_with_defaults(
                             vec![voters.iter().map(|v| v.node).collect()],
                             prior.non_write_voter_ids(),
                         )
             } else if let Some(third) = third_at(db, entry.log_id.index)? {
-                let first = joined_at(db, entry.log_id.index)?
-                    .ok_or(invalid("missing predecessor voter"))?;
+                let voters = super::quorum::voters(db, entry.log_id.index)?;
                 entry.log_id == third.log_id
-                    && members == join::promotion::roster(creator.node, first.node, third.node)
                     && entry.payload.join_command()?.is_some()
+                    && members
+                        == Members::new_with_defaults(
+                            vec![voters.iter().map(|v| v.node).collect()],
+                            [],
+                        )
             } else if let Some(member) = joined_at(db, entry.log_id.index)? {
                 (entry.log_id == member.log_id
                     && members == join::target(creator.node, member.node)

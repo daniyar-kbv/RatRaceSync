@@ -108,6 +108,9 @@ impl GameNode {
             body[&3].to_vec(),
             body[&4].try_into().map_err(io::Error::other)?,
         );
+        self.lock_request(key).await
+    }
+    pub(crate) async fn lock_request(&self, key: RequestKey) -> io::Result<OwnedMutexGuard<()>> {
         let lock = {
             let mut pending = self
                 .pending_requests
