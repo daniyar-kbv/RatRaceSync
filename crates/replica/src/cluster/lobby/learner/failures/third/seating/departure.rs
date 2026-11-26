@@ -72,7 +72,21 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
                 .await
                 .unwrap();
         }
+        if second_leaves {
+            let claim = host
+                .seat_claim_guard(&survivor.actor, SeatId::new(3).unwrap())
+                .await
+                .unwrap();
+            host.submit(claim.sign(request(149), key_s)).await.unwrap();
+        }
         let before = host.lobby_seating(ACTOR).await.unwrap();
+        let first_auditor = if second_leaves {
+            survivor.actor.as_slice()
+        } else {
+            actor
+        };
+        assert_eq!(before.auditor_for(ACTOR), Some(first_auditor));
+        assert_eq!(before.auditor_for(actor), Some(ACTOR));
         assert!(before.seats[0].ready && before.seats[1].ready);
         let high = crate::learner::history::boundary(&host.replica.lock().unwrap()).unwrap();
         for peer in [guest, survivor] {
@@ -103,7 +117,67 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
         let b = survivor.node.leave_approval(&cmd, key_s).unwrap();
         assert!(guest.node.leave_approval(&cmd, key_g).is_err());
         assert!(host.leave_lobby(&cmd, [&a, &a]).await.is_err());
-        let result = host.leave_lobby(&cmd, [&a, &b]).await.unwrap();
+        let authority = guest.promotion_authority();
+        let candidate =
+            VoteRequest::<Types>::new(Vote::new(high.leader_id.term + 1, guest.id()), Some(high));
+        if !second_leaves {
+            // The departing installation can miss the membership entry entirely.
+            guest.node.raft.runtime_config().elect(false);
+            assert!(
+                authority
+                    .election(&candidate, true, key_g)
+                    .unwrap()
+                    .is_some()
+            );
+            r.p.bus.1.lock().unwrap().remove(&guest.id());
+        }
+        if second_leaves {
+            let attempted = Arc::new(tokio::sync::Notify::new());
+            *r.p.bus.6.lock().unwrap() = Some(PausedReplication {
+                command: cmd.0.clone(),
+                attempted: attempted.clone(),
+            });
+            let collision = host
+                .seat_release_guard(actor)
+                .await
+                .unwrap()
+                .sign(request(154), key_g);
+            let pending = tokio::spawn({
+                let (host, cmd, a, b) = (host.clone(), cmd.clone(), a.clone(), b.clone());
+                async move { host.leave_lobby(&cmd, [&a, &b]).await }
+            });
+            timeout(Duration::from_secs(6), attempted.notified())
+                .await
+                .unwrap();
+            pending.abort();
+            assert!(pending.await.unwrap_err().is_cancelled());
+            let delivery = host.submit(collision);
+            tokio::pin!(delivery);
+            assert!(
+                timeout(Duration::from_millis(120), &mut delivery)
+                    .await
+                    .is_err()
+            );
+            r.p.bus.6.lock().unwrap().take();
+            assert_eq!(
+                timeout(Duration::from_secs(6), delivery)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Reply::RequestIdConflict
+            );
+        }
+        let (first, overlapping) = tokio::join!(
+            host.leave_lobby(&cmd, [&a, &b]),
+            host.leave_lobby(&cmd, [&a, &b])
+        );
+        let result = first.unwrap();
+        assert_eq!(overlapping.unwrap(), result);
+        assert_eq!(
+            host.leave_lobby(&cmd, [&[0; 513], &[]]).await.unwrap(),
+            result,
+            "a committed retry does not depend on proposal attachments"
+        );
         let view = host.lobby_seating(ACTOR).await.unwrap();
         assert!(view.seats.iter().all(|s| !s.ready));
         assert_eq!(view.seats[0].occupant.as_deref(), Some(ACTOR));
@@ -111,7 +185,21 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
         assert!(view.seats[1].occupant.is_none());
         assert_eq!(view.seats[1].revision, before.seats[1].revision + 1);
         assert_eq!(view.setup_revision, before.setup_revision + 1);
+        assert_eq!(view.auditor_for(actor), None);
+        assert_eq!(
+            view.auditor_for(ACTOR),
+            second_leaves.then_some(survivor.actor.as_slice())
+        );
+        assert_eq!(
+            view.auditor_for(&survivor.actor),
+            second_leaves.then_some(ACTOR)
+        );
         assert!(host.lobby_seating(actor).await.is_err());
+        assert!(
+            host.answer_history_request(guest.id(), VotingHistoryRequest::Retained(high), &key())
+                .is_err(),
+            "a former voter cannot request old checkpoints from a surviving peer"
+        );
         assert_eq!(host.raft.voter_ids().count(), 2);
         assert!(!host.raft.voter_ids().any(|v| v == guest.id()));
         assert_eq!(host.leave_lobby(&cmd, [&[], &[]]).await.unwrap(), result);
@@ -186,8 +274,12 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
             guest.pending_lobby_leave(request(154), key_g).unwrap().0,
             cmd.0
         );
-        let host_confirmation = host.leave_confirmation(&cmd, &key()).unwrap();
-        let guest_confirmation = survivor.node.leave_confirmation(&cmd, key_s).unwrap();
+        let envelope = fields(&cmd.0, &[1, 2]).unwrap();
+        let retry = Signed(message(&[(2, envelope[&2]), (1, envelope[&1])]));
+        assert_ne!(retry.0, cmd.0);
+        assert_eq!(host.leave_lobby(&retry, [&[], &[]]).await.unwrap(), result);
+        let host_confirmation = host.leave_confirmation(&retry, &key()).unwrap();
+        let guest_confirmation = survivor.node.leave_confirmation(&retry, key_s).unwrap();
         let catalog = if second_leaves {
             &mut r.p.catalog
         } else {
@@ -195,7 +287,7 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
         };
         assert!(
             catalog
-                .finish_lobby_leave(guest, &cmd, [&host_confirmation, &host_confirmation])
+                .finish_lobby_leave(guest, &retry, [&host_confirmation, &host_confirmation])
                 .is_err()
         );
         assert_eq!(catalog.active_pin().unwrap(), Some(r.p.game.fingerprint));
@@ -209,15 +301,30 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
                 .unwrap();
             assert!(
                 catalog
-                    .finish_lobby_leave(guest, &cmd, [&host_confirmation, &guest_confirmation])
+                    .finish_lobby_leave(guest, &retry, [&host_confirmation, &guest_confirmation])
                     .is_err()
             );
             assert_eq!(catalog.active_pin().unwrap(), Some(r.p.game.fingerprint));
         } else {
-            for _ in 0..2 {
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    let game = guest.node.replica.lock().unwrap();
+                    assert_eq!(
+                        game.execute(
+                            "DELETE FROM meta WHERE name=?",
+                            [crate::seating::departure::confirmation::LOCAL],
+                        )
+                        .unwrap(),
+                        1
+                    );
+                }
                 assert_eq!(
                     catalog
-                        .finish_lobby_leave(guest, &cmd, [&host_confirmation, &guest_confirmation])
+                        .finish_lobby_leave(
+                            guest,
+                            &retry,
+                            [&host_confirmation, &guest_confirmation]
+                        )
                         .unwrap(),
                     result
                 );
@@ -225,6 +332,25 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
             assert!(catalog.active_pin().unwrap().is_none());
         }
         assert!(guest.joined_node().is_err());
+        assert!(
+            guest
+                .node
+                .answer_history_request(
+                    r.p.game.creator_node,
+                    VotingHistoryRequest::Retained(high),
+                    key_g
+                )
+                .is_err(),
+            "a released installation cannot continue serving voter RPCs"
+        );
+        assert!(guest.node.sign_voting_checkpoint(high, key_g).is_err());
+        assert!(
+            !matches!(authority.election(&candidate, true, key_g), Ok(Some(_))),
+            "a cached promotion cannot sign a new election after local retirement"
+        );
+        drop(authority);
+        let departed_id = guest.id();
+        let departed_actor = actor.to_vec();
         let session = r.p.game.session.clone();
         let host_id = r.p.game.creator_node;
         let surviving_key = key_s.clone();
@@ -242,6 +368,37 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
             departed_catalog.departure_receipt(&session).unwrap(),
             Some(result.clone())
         );
+        let game_path = root
+            .path()
+            .join(departed)
+            .join(format!("learner-{departed_id}-g1.sqlite"));
+        let game = rusqlite::Connection::open(&game_path).unwrap();
+        assert_eq!(
+            game.execute(
+                "UPDATE seat_history SET revision=? WHERE occupant=?",
+                rusqlite::params![99u64.to_be_bytes(), departed_actor]
+            ),
+            Ok(1)
+        );
+        assert!(
+            departed_catalog.departure_receipt(&session).is_err(),
+            "the confirmed seat closure must match the retained observation"
+        );
+        game.execute(
+            "UPDATE seat_history SET revision=? WHERE occupant=?",
+            rusqlite::params![before.seats[1].revision.to_be_bytes(), departed_actor],
+        )
+        .unwrap();
+        game.execute(
+            "UPDATE archive SET digest=zeroblob(32) WHERE idx=?",
+            [0u64.to_be_bytes()],
+        )
+        .unwrap();
+        assert!(
+            departed_catalog.departure_receipt(&session).is_err(),
+            "a saved signature cannot replace the retained genesis entry"
+        );
+        drop(game);
         let next = create(&mut departed_catalog, intent(2)).await.unwrap();
         assert_ne!(next.session, session);
         next.node.raft.shutdown().await.unwrap();
@@ -288,10 +445,13 @@ async fn guest_leaves_three_voters_with_one_original_membership_receipt() {
             .await
             .unwrap();
         assert_eq!(leader.leave_lobby(&cmd, [&[], &[]]).await.unwrap(), result);
-        let seat = leader
-            .seat_claim_guard(&surviving_actor, SeatId::new(2).unwrap())
-            .await
-            .unwrap();
+        let target = SeatId::new(2).unwrap();
+        let seat = if second_leaves {
+            leader.seat_change_guard(&surviving_actor, target).await
+        } else {
+            leader.seat_claim_guard(&surviving_actor, target).await
+        }
+        .unwrap();
         leader
             .submit(seat.sign(request(155), &surviving_key))
             .await

@@ -1,7 +1,9 @@
 //! One direct three-to-two transition. Both successor voters retain the old
 //! prefix before authorizing a proposal. Only committed application creates the receipt.
 use super::*;
-use openraft::{alias::StoredMembershipOf, entry::RaftPayload, raft::Precondition};
+use openraft::{
+    alias::StoredMembershipOf, entry::RaftPayload, raft::Precondition, type_config::TypeConfigExt,
+};
 
 pub(crate) mod confirmation;
 const SOURCE: &[u8] = b"RatRaceSync/leave-membership/v1";
@@ -20,6 +22,19 @@ pub(crate) fn locally_retired(db: &Connection) -> io::Result<bool> {
     )
     .map_err(io::Error::other)
 }
+pub(crate) fn reject_departed(
+    db: &Connection,
+    local: ReplicaId,
+    peer: Option<ReplicaId>,
+) -> io::Result<()> {
+    if locally_retired(db)?
+        || left_at(db, u64::MAX)?.is_some_and(|d| d.node == local || Some(d.node) == peer)
+    {
+        return Err(invalid("departed voter"));
+    }
+    Ok(())
+}
+
 pub(crate) fn left_at(db: &Connection, index: u64) -> io::Result<Option<Departure>> {
     Ok(store::meta::<Departure>(db, "departed_member")?.filter(|d| d.log_id.index <= index))
 }
@@ -165,49 +180,46 @@ pub(crate) fn check_retained(
     }
     verify_entry(r, db, e, raw).map(|_| ())
 }
-pub(super) fn commit(
-    r: &Replica,
-    db: &Transaction<'_>,
-    k: LogId,
+struct DepartureOutcome {
+    vacancy: Option<(SeatId, u64)>,
+    setup: u64,
+    effect: effect::Effect,
+}
+
+fn outcome_at(
+    db: &Connection,
+    index: u64,
     g: &SeatCommandGuard,
-) -> io::Result<effect::Effect> {
-    let Dependencies::Membership { configuration, .. } = g.material else {
+    effective: &[u8],
+) -> io::Result<DepartureOutcome> {
+    let Dependencies::Membership {
+        configuration,
+        setup: before,
+    } = g.material
+    else {
         return Err(invalid("missing Leave dependencies"));
     };
-    let state = layout_at(db, u64::MAX)?;
-    let seats = Snapshot::at(r, db, &state, u64::MAX)?.view();
-    let old = seats
-        .iter()
-        .find(|s| s.occupant.as_deref() == Some(&g.actor));
-    let seat = old.map(|s| s.id.get());
-    let before = setup_revision(db)?;
+    let state = layout_at(db, index)?;
+    let snapshot = Snapshot::at(true, db, &state, index)?;
+    let occupied = snapshot
+        .seating()
+        .seats()
+        .find(|(_, p)| p.is_some_and(|p| p.as_ref() == g.actor))
+        .map(|(id, _)| id);
+    let seat = occupied.map(SeatId::get);
+    let revision = occupied.map(|id| snapshot.revision(id));
+    let next_revision = revision
+        .map(|v| v.checked_add(1).ok_or(invalid("seat revision exhausted")))
+        .transpose()?;
     let after = before
         .checked_add(1)
         .ok_or(invalid("setup revision exhausted"))?;
-    let mut revisions = None;
-    if let Some(s) = old {
-        let rev = s
-            .revision
-            .checked_add(1)
-            .ok_or(invalid("seat revision exhausted"))?;
-        revisions = Some((s.revision.to_be_bytes(), rev.to_be_bytes()));
-        db.execute(
-            "INSERT INTO seat_history(seat,idx,revision,changed_by,occupant) VALUES(?,?,?,?,NULL)",
-            params![
-                s.id.get(),
-                k.index.to_be_bytes(),
-                rev.to_be_bytes(),
-                g.actor
-            ],
-        )
-        .map_err(io::Error::other)?;
-    }
     let mut resets = Vec::new();
     let mut acknowledgment_facts = Vec::new();
     // Read the pre-entry history, including acknowledgments of the remaining voters.
-    let others = successors(db, &g.actor, k.index - 1)?;
+    let others = successors(db, &g.actor, index)?;
     for actor in [&g.actor, &others[0].actor, &others[1].actor] {
-        let h = preference::history(db, actor, k.index - 1)?;
+        let h = preference::history(db, actor, index)?;
         if actor == &g.actor || h.ack.is_some() {
             let ack = h.ack.map(u64::to_be_bytes);
             let previous_ack = ack.as_ref().map_or(&[][..], |n| n.as_slice());
@@ -226,21 +238,11 @@ pub(super) fn commit(
             );
         }
     }
-    r.advance_setup(db, k.index, after)?;
-    store::put(
-        db,
-        "departed_member",
-        &Departure {
-            node: g.node,
-            actor: g.actor.clone(),
-            log_id: k,
-        },
-    )?;
     let member = message(&[(1, &g.node.0), (2, &[1]), (3, &[2])]);
-    let (old_revision, new_revision) =
-        revisions.as_ref().map_or((&[][..], &[][..]), |(old, new)| {
-            (old.as_slice(), new.as_slice())
-        });
+    let revision_bytes = revision.map(u64::to_be_bytes);
+    let next_bytes = next_revision.map(u64::to_be_bytes);
+    let old_revision = revision_bytes.as_ref().map_or(&[][..], |n| n.as_slice());
+    let new_revision = next_bytes.as_ref().map_or(&[][..], |n| n.as_slice());
     let closure = message(&[
         (1, seat.as_slice()),
         (2, &[]),
@@ -250,9 +252,8 @@ pub(super) fn commit(
         (6, old_revision),
         (7, new_revision),
     ]);
-    let effective = log_key(k);
-    let refs = message(&[(1, &configuration), (2, &effective)]);
-    Ok(effect::Effect {
+    let refs = message(&[(1, &configuration), (2, effective)]);
+    let effect = effect::Effect {
         record: message(&[
             (1, &g.actor),
             (2, &member),
@@ -274,9 +275,46 @@ pub(super) fn commit(
             &after.to_be_bytes(),
             &[],
             &configuration,
-            &effective,
+            effective,
         ]),
+    };
+    Ok(DepartureOutcome {
+        vacancy: occupied.zip(next_revision),
+        setup: after,
+        effect,
     })
+}
+
+pub(super) fn commit(
+    r: &Replica,
+    db: &Transaction<'_>,
+    k: LogId,
+    g: &SeatCommandGuard,
+) -> io::Result<effect::Effect> {
+    let outcome = outcome_at(db, k.index - 1, g, &log_key(k))?;
+    if let Some((seat, revision)) = outcome.vacancy {
+        db.execute(
+            "INSERT INTO seat_history(seat,idx,revision,changed_by,occupant) VALUES(?,?,?,?,NULL)",
+            params![
+                seat.get(),
+                k.index.to_be_bytes(),
+                revision.to_be_bytes(),
+                g.actor
+            ],
+        )
+        .map_err(io::Error::other)?;
+    }
+    r.advance_setup(db, k.index, outcome.setup)?;
+    store::put(
+        db,
+        "departed_member",
+        &Departure {
+            node: g.node,
+            actor: g.actor.clone(),
+            log_id: k,
+        },
+    )?;
+    Ok(outcome.effect)
 }
 
 impl Learner {
@@ -328,24 +366,13 @@ impl GameNode {
     /// The source-bearing membership entry is the only owner of the Leave receipt.
     /// Approvals are supplied in creator, surviving guest order. A retry needs only the intent.
     pub async fn leave_lobby(&self, cmd: &Signed, approvals: [&[u8]; 2]) -> io::Result<Vec<u8>> {
+        let permit = self.request_permit(cmd).await?;
         self.raft
             .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
             .await
             .map_err(io::Error::other)?;
         let r = &self.replica;
-        if cmd.0.len() > 2048 {
-            return Err(invalid("oversized Leave command"));
-        }
-        if approvals.iter().any(|p| p.len() > 512) {
-            return Err(invalid("oversize Leave approval"));
-        }
-        let packet = message(&[
-            (1, SOURCE),
-            (2, &cmd.0),
-            (3, approvals[0]),
-            (4, approvals[1]),
-        ]);
-        let (high, prior, members) = {
+        let (high, prior, members, packet) = {
             let db = r.lock()?;
             r.require_lobby_genesis(&db)?;
             r.verify_replay(&db)?;
@@ -353,15 +380,26 @@ impl GameNode {
             if let Some(original) = c.committed_receipt(&db)? {
                 return Ok(original);
             }
+            if approvals.iter().any(|p| p.len() > 512) {
+                return Err(invalid("oversize Leave approval"));
+            }
+            let packet = message(&[
+                (1, SOURCE),
+                (2, &cmd.0),
+                (3, approvals[0]),
+                (4, approvals[1]),
+            ]);
             let high = crate::learner::history::boundary(&db)?;
             let prior = crate::learner::history::membership(&db)?
                 .log_id()
                 .ok_or(invalid("missing membership"))?;
-            (high, prior, verify_proposal(r, &db, &packet, high)?)
+            (high, prior, verify_proposal(r, &db, &packet, high)?, packet)
         };
-        let response = self
-            .raft
-            .append_membership(
+        let raft = self.raft.clone();
+        // A disconnected caller cannot release this request while its membership write is pending.
+        let response = Types::spawn(async move {
+            let _permit = permit;
+            raft.append_membership(
                 members,
                 Source::blank().with_normal(Signed(packet)),
                 [
@@ -377,7 +415,10 @@ impl GameNode {
                 ],
             )
             .await
-            .map_err(io::Error::other)?;
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
         match response.data {
             Reply::Receipt(receipt) => Ok(receipt),
             _ => Err(invalid("missing Leave receipt")),

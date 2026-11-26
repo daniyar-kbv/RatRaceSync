@@ -31,10 +31,7 @@ impl GameNode {
             .committed_receipt(&db)?
             .ok_or(invalid("missing original departure receipt"))?;
         let f = fields(&receipt, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
-        if f[&5] != log_key(d.log_id)
-            || c.guard.node != d.node
-            || !archived_seat_command(&db, &receipt)?.is_some_and(|s| s.0 == raw.0)
-        {
+        if f[&5] != log_key(d.log_id) || c.guard.node != d.node {
             return Err(invalid("wrong departure receipt"));
         }
         let voters = successors(&db, &d.actor, d.log_id.index - 1)?;
@@ -64,55 +61,49 @@ impl Evidence {
         if self.command.0.len() > 2048 || self.confirmations.iter().any(|p| p.len() > 8192) {
             return Err(invalid("oversized departure proof"));
         }
-        let env = fields(&self.command.0, &[1, 2])?;
-        let intent = fields(env[&1], &[1, 2, 3, 4, 5, 12])?;
-        if intent[&1] != lobby::LobbyFormat::Departure.profile()
-            || intent[&2] != session
-            || !matches!(action(intent[&12])?, TableAction::Leave)
-        {
-            return Err(invalid("wrong departure intent"));
+        let verify = |signed: &Signed| {
+            SeatCommand::verify_in_game(lobby::LobbyFormat::Departure, session, db, &signed.0)
+        };
+        let intent = verify(&self.command)?;
+        let guard = &intent.guard;
+        if !matches!(guard.action, TableAction::Leave) || guard.node != local {
+            return Err(invalid("wrong departing installation or operation"));
         }
-        let request = intent[&4].try_into().map_err(io::Error::other)?;
-        let guard = fields(intent[&5], &[1, 2, 3, 4, 5, 6])?;
+        let request = intent.request;
+        let fingerprint = guard.fingerprint(&request);
         let index: [u8; 8] = db
-            .query_row("SELECT idx FROM archive WHERE log_id=?", [guard[&3]], |r| {
-                r.get(0)
-            })
-            .map_err(io::Error::other)?;
-        let index = u64::from_be_bytes(index);
-        let (id, key) = member(db, intent[&3], index)?;
-        if local != id || guard[&1] != local.0 {
-            return Err(invalid("wrong departing installation"));
-        }
-        VerifyingKey::from_bytes(&key)
-            .map_err(io::Error::other)?
-            .verify_strict(
-                env[&1],
-                &Signature::from_slice(env[&2]).map_err(io::Error::other)?,
+            .query_row(
+                "SELECT idx FROM archive WHERE log_id=?",
+                [guard.observed],
+                |row| row.get(0),
             )
             .map_err(io::Error::other)?;
+        let index = u64::from_be_bytes(index);
         let first = fields(&self.confirmations[0], &[1, 2])?;
         let body = fields(first[&1], &[1, 2, 3, 4, 5])?;
         let receipt = body[&5];
         let record = fields(receipt, &[1, 2, 3, 4, 5, 6, 7, 8, 9])?;
         let outcome = fields(record[&7], &[12])?;
         let leave = fields(outcome[&12], &[209])?;
-        let effect = fields(leave[&209], &[1, 2, 3, 4, 5])?;
-        let membership = fields(effect[&2], &[1, 2, 3])?;
+        let effective: &[u8; 32] = record[&5].try_into().map_err(io::Error::other)?;
+        let sequence = i64::from_be_bytes(record[&6].try_into().map_err(io::Error::other)?);
         if record[&1] != session
-            || record[&2] != intent[&3]
+            || record[&2] != guard.actor
             || record[&3] != request
-            || effect[&1] != intent[&3]
-            || membership[&1] != local.0
-            || membership[&2] != [1]
-            || membership[&3] != [2]
+            || record[&4] != fingerprint
+            || sequence <= 0
+            || record[&8].len() != 32
+            || record[&9].len() != 32
+            || effective[24..] <= guard.observed[24..]
+            || effective[..8] < guard.observed[..8]
+            || outcome_at(db, index, guard, effective)?.effect.record != leave[&209]
         {
             return Err(invalid("wrong confirmed departure outcome"));
         }
         let applied: Option<Vec<u8>> = db
             .query_row(
                 "SELECT record FROM receipt WHERE actor=? AND request=?",
-                params![intent[&3], request],
+                params![guard.actor.as_slice(), request],
                 |row| row.get(0),
             )
             .optional()
@@ -122,16 +113,17 @@ impl Evidence {
             Some(_) => return Err(invalid("confirmed departure differs from local receipt")),
             None => store::meta::<Signed>(db, &local_request_key(local, request))?,
         };
-        if !original.is_some_and(|saved| saved.0 == self.command.0) {
+        let reserved = verify(&original.ok_or(invalid("missing local Leave command"))?)?;
+        if reserved.request != request || reserved.guard.fingerprint(&request) != fingerprint {
             return Err(invalid("missing original local Leave command"));
         }
         if confirmation(session, pin, &self.command, receipt) != first[&1] {
             return Err(invalid("wrong confirmed game or command"));
         }
-        for (proof, who) in self
-            .confirmations
-            .iter()
-            .zip(successors(db, intent[&3], index)?)
+        for (proof, who) in
+            self.confirmations
+                .iter()
+                .zip(successors(db, guard.actor.as_slice(), index)?)
         {
             let f = fields(proof, &[1, 2])?;
             if f[&1] != first[&1] {

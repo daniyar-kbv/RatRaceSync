@@ -8,14 +8,14 @@ pub(super) struct Snapshot {
 
 impl Snapshot {
     pub(super) fn at(
-        r: &Replica,
+        has_seat_history: bool,
         db: &Connection,
         state: &OpenLayout,
         index: u64,
     ) -> io::Result<Self> {
         let mut table = state.seats.clone();
         let mut revisions = BTreeMap::new();
-        if r.seat_changes() {
+        if has_seat_history {
             let mut query = db.prepare("SELECT occupant,revision FROM seat_history WHERE seat=? AND idx<=? ORDER BY idx DESC LIMIT 1").map_err(io::Error::other)?;
             for (seat, _) in state.seats.seats() {
                 let n = seat.get();

@@ -36,9 +36,16 @@ impl GameNode {
             | VotingHistoryRequest::Store { checkpoint: k, .. }
             | VotingHistoryRequest::Confirm { checkpoint: k, .. } => k.index,
         };
-        let voters = voters(&*self.replica.lock()?, index)?;
-        if self.replica.local_node == Some(sender) || !voters.iter().any(|v| v.node == sender) {
-            return Err(invalid("unauthorized history peer"));
+        {
+            let db = self.replica.lock()?;
+            let local = self
+                .replica
+                .local_node
+                .ok_or(invalid("missing local incarnation"))?;
+            seating::departure::reject_departed(&db, local, Some(sender))?;
+            if local == sender || !voters(&db, index)?.iter().any(|v| v.node == sender) {
+                return Err(invalid("unauthorized history peer"));
+            }
         }
         match request {
             VotingHistoryRequest::Retained(k) => self.retained_certificate(k),
@@ -141,7 +148,14 @@ fn committed(r: &Replica, db: &Connection, k: LogId) -> io::Result<Vec<Creator>>
     r.verify_replay(db)?;
     voters(db, k.index)
 }
-fn signer<'a>(r: &Replica, voters: &'a [Creator], key: &SigningKey) -> io::Result<&'a Creator> {
+fn signer<'a>(
+    r: &Replica,
+    db: &Connection,
+    voters: &'a [Creator],
+    key: &SigningKey,
+) -> io::Result<&'a Creator> {
+    let local = r.local_node.ok_or(invalid("missing local incarnation"))?;
+    seating::departure::reject_departed(db, local, None)?;
     voters
         .iter()
         .find(|v| r.local_node == Some(v.node) && &v.key == key.verifying_key().as_bytes())
@@ -215,11 +229,7 @@ impl Learner {
         let db = self.node.replica.lock()?;
         self.node.replica.require_lobby_genesis(&db)?;
         self.node.replica.verify_replay(&db)?;
-        if seating::departure::locally_retired(&db)?
-            || seating::departure::left_at(&db, u64::MAX)?.is_some_and(|d| d.node == self.id)
-        {
-            return Err(invalid("local member has left"));
-        }
+        seating::departure::reject_departed(&db, self.id, None)?;
         let member = join::member_for(&db, self.id)?.ok_or(invalid("learner has not joined"))?;
         if member.actor != self.actor || member.node != self.id || member.key != self.key {
             return Err(invalid("joined incarnation differs from installation"));
@@ -233,7 +243,7 @@ impl GameNode {
         let r = &self.replica;
         let db = r.lock()?;
         let voters = committed(r, &db, k)?;
-        let local = signer(r, &voters, key)?;
+        let local = signer(r, &db, &voters, key)?;
         Ok(signed(
             &history::signer_record(r, &db, k.index, local)?,
             key,
@@ -252,7 +262,7 @@ impl GameNode {
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
         let voters = committed(r, &tx, k)?;
-        let local = signer(r, &voters, key)?;
+        let local = signer(r, &tx, &voters, key)?;
         let cert = certificate(r, &tx, k.index, a, b)?;
         if let Some(third) = history::third_at(&tx, k.index)? {
             let parent = bundles::default_parent(r, &tx, third.log_id, k)?;

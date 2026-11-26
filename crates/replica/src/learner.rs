@@ -151,13 +151,7 @@ impl LearnerReplication {
         source: Option<&[u8]>,
     ) -> io::Result<openraft::raft::VoteResponse<Types>> {
         let voters: Vec<_> = self.raft.voter_ids().collect();
-        if seating::departure::locally_retired(&*self.replica.lock()?)? {
-            return Err(invalid("local voter has left"));
-        }
-        let retired = seating::departure::left_at(&*self.replica.lock()?, u64::MAX)?;
-        if retired.is_some_and(|d| d.node == sender || d.node == self.local) {
-            return Err(invalid("departed voter"));
-        }
+        seating::departure::reject_departed(&*self.replica.lock()?, self.local, Some(sender))?;
         if sender == self.local || request.vote.leader_id.node_id != sender {
             return Err(invalid("incorrect authenticated candidate"));
         }
@@ -211,13 +205,11 @@ impl LearnerReplication {
     ) -> io::Result<openraft::raft::AppendResult<Types>> {
         let route = { third::local_route(&self.replica, &*self.replica.lock()?)? };
         let voters: Vec<_> = self.raft.voter_ids().collect();
-        if seating::departure::locally_retired(&*self.replica.lock()?)? {
-            return Err(invalid("local voter has left"));
-        }
-        let retired = seating::departure::left_at(&*self.replica.lock()?, u64::MAX)?;
-        if retired.is_some_and(|d| d.node == authenticated_sender || d.node == self.local) {
-            return Err(invalid("departed replication participant"));
-        }
+        seating::departure::reject_departed(
+            &*self.replica.lock()?,
+            self.local,
+            Some(authenticated_sender),
+        )?;
         let eligible_sender = if voters.len() == 3 {
             voters.contains(&authenticated_sender) && self.local != authenticated_sender
         } else {

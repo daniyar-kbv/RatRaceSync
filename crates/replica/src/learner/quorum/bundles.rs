@@ -167,7 +167,8 @@ impl GameNode {
         let mut db = r.lock()?;
         let tx = db.transaction().map_err(io::Error::other)?;
         let voters = committed(r, &tx, k)?;
-        store(r, tx, k, parent, cert, signer(r, &voters, key)?, key)
+        let local = signer(r, &tx, &voters, key)?;
+        store(r, tx, k, parent, cert, local, key)
     }
     pub(super) async fn reconcile_bundle(
         &self,

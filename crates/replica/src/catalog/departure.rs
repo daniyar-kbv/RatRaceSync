@@ -61,6 +61,9 @@ impl InstallationCatalog {
                 if receipt != old {
                     return Err(invalid("departure receipt differs from catalog"));
                 }
+                if prior.is_none() {
+                    store::put(&game, LOCAL, evidence)?;
+                }
                 return Ok(old);
             }
         }
@@ -122,14 +125,16 @@ impl InstallationCatalog {
         let mut db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(io::Error::other)?;
         let tx = db.transaction().map_err(io::Error::other)?;
-        let creator = store::meta::<Creator>(&tx, "creator")?.ok_or(invalid("missing creator"))?;
-        verify_game_identity(&tx, session, Some(&creator), Some(id))?;
-        let genesis = store::meta::<genesis::SignedGenesis>(&tx, "signed_genesis")?
-            .ok_or(invalid("missing signed root"))?;
-        genesis.verify(&genesis.body, &creator)?;
+        genesis::verify_pinned_game(
+            &tx,
+            session,
+            LobbyFormat::Departure.profile(),
+            Some(id),
+            &pin,
+        )?;
         let evidence =
             store::meta::<Evidence>(&tx, LOCAL)?.ok_or(invalid("missing local departure proof"))?;
-        if genesis.fingerprint != pin || evidence.verify(&tx, session, &pin, id)? != receipt {
+        if evidence.verify(&tx, session, &pin, id)? != receipt {
             return Err(invalid("departure proof differs from catalog"));
         }
         Ok(Some(receipt))

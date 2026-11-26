@@ -93,7 +93,7 @@ impl GameNode {
         }
         self.submit_authorized(signed).await
     }
-    async fn request_permit(&self, signed: &Signed) -> io::Result<OwnedMutexGuard<()>> {
+    pub(crate) async fn request_permit(&self, signed: &Signed) -> io::Result<OwnedMutexGuard<()>> {
         if signed.0.len() > 2048 {
             return Err(invalid("oversized command"));
         }

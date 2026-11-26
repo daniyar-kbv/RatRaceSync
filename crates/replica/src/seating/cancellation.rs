@@ -30,7 +30,7 @@ pub(super) fn commit(
         return Err(invalid("missing cancellation guard"));
     };
     let state = layout_at(db, u64::MAX)?;
-    let seats = Snapshot::at(r, db, &state, u64::MAX)?.view();
+    let seats = Snapshot::at(r.seat_changes(), db, &state, u64::MAX)?.view();
     let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
     let mut members = vec![(1, creator.actor, creator.node)];
     let departed = departure::left_at(db, k.index)?;

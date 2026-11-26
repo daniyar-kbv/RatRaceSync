@@ -253,39 +253,31 @@ enum Change {
     Preference(preference::Transition),
 }
 impl TableAction {
-    fn guard_tags(self, r: &Replica) -> io::Result<&'static [u32]> {
+    fn guard_tags(self, format: lobby::LobbyFormat) -> io::Result<&'static [u32]> {
         match self {
-            Self::Leave if r.lobby_format == Some(lobby::LobbyFormat::Departure) => {
-                Ok(&[1, 2, 3, 4, 5, 6])
-            }
-            Self::Cancel if r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) => {
-                Ok(&[1, 2, 3, 4, 5, 6])
-            }
-            Self::Preference(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::preferences) => {
-                Ok(&[1, 2, 3, 4, 5, 6, 7])
-            }
-            Self::Resize(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::resizable) => {
-                Ok(&[1, 2, 3, 4, 5])
-            }
-            Self::Occupancy(_) if r.seat_changes() => Ok(&[1, 2, 3, 4, 5, 6, 7, 8]),
-            Self::Occupancy(SeatAction::Claim(_)) if r.seating_enabled() => Ok(&[1, 2, 3, 4, 5]),
+            Self::Leave if format == lobby::LobbyFormat::Departure => Ok(&[1, 2, 3, 4, 5, 6]),
+            Self::Cancel if format.cancellable() => Ok(&[1, 2, 3, 4, 5, 6]),
+            Self::Preference(_) if format.preferences() => Ok(&[1, 2, 3, 4, 5, 6, 7]),
+            Self::Resize(_) if format.resizable() => Ok(&[1, 2, 3, 4, 5]),
+            Self::Occupancy(_) if format.seat_history() => Ok(&[1, 2, 3, 4, 5, 6, 7, 8]),
+            Self::Occupancy(SeatAction::Claim(_)) if format.seating() => Ok(&[1, 2, 3, 4, 5]),
             _ => Err(invalid("operation outside pinned lobby profile")),
         }
     }
 
     fn evaluate(
         self,
-        r: &Replica,
+        has_seat_history: bool,
         db: &Connection,
         state: &OpenLayout,
         actor: &[u8],
         index: u64,
     ) -> io::Result<(Change, Dependencies)> {
-        let table = Snapshot::at(r, db, state, index)?;
+        let table = Snapshot::at(has_seat_history, db, state, index)?;
         match self {
             Self::Occupancy(action) => {
                 let tr = table.transition(actor, action)?;
-                let material = if r.seat_changes() {
+                let material = if has_seat_history {
                     Dependencies::Occupancy(Material::at(db, &table, actor, index, tr)?)
                 } else {
                     Dependencies::Legacy
@@ -412,19 +404,30 @@ struct SeatCommand {
 }
 impl SeatCommand {
     fn verify(r: &Replica, db: &Connection, raw: &[u8]) -> io::Result<Self> {
-        if raw.len() > 2048 || !r.seating_enabled() {
+        let format = r
+            .lobby_format
+            .ok_or(invalid("missing seat command profile"))?;
+        Self::verify_in_game(format, &r.session, db, raw)
+    }
+    fn verify_in_game(
+        format: lobby::LobbyFormat,
+        session: &[u8],
+        db: &Connection,
+        raw: &[u8],
+    ) -> io::Result<Self> {
+        if raw.len() > 2048 || !format.seating() {
             return Err(invalid("unsupported seat command profile or size"));
         }
         let envelope = fields(raw, &[1, 2])?;
         let body = fields(envelope[&1], &[1, 2, 3, 4, 5, 12])?;
         let action = action(body[&12])?;
-        let tags = action.guard_tags(r)?;
+        let tags = action.guard_tags(format)?;
         let guard = fields(body[&5], tags)?;
         let request: [u8; 16] = body[&4].try_into().map_err(io::Error::other)?;
         let observed: [u8; 32] = guard[&3].try_into().map_err(io::Error::other)?;
         let layout = u64::from_be_bytes(guard[&4].try_into().map_err(io::Error::other)?);
-        if body[&1] != r.profile()
-            || body[&2] != r.session
+        if body[&1] != format.profile()
+            || body[&2] != session
             || body[&3].is_empty()
             || body[&3].len() > 64
             || request[6] >> 4 != 4
@@ -456,10 +459,10 @@ impl SeatCommand {
         if layout != state.layout_revision {
             return Err(invalid("invalid observed layout revision"));
         }
-        let (_, material) = action.evaluate(r, db, &state, body[&3], index)?;
+        let (_, material) = action.evaluate(format.seat_history(), db, &state, body[&3], index)?;
         let mut expected = SeatCommandGuard {
-            profile: r.profile().into(),
-            session: r.session.clone(),
+            profile: format.profile().into(),
+            session: session.into(),
             actor: body[&3].into(),
             node,
             observed,
@@ -471,7 +474,7 @@ impl SeatCommand {
         };
         if let TableAction::Preference(action) = action {
             let proof = LobbyIntent(guard[&7].to_vec());
-            let (owner, id, op) = proof.authenticate_at(r, db, node, index)?;
+            let (owner, id, op) = proof.authenticate_at(session, db, node, index)?;
             if owner != body[&3] || id != request || op != action {
                 return Err(invalid("witness belongs to a different intent"));
             }
@@ -497,11 +500,15 @@ impl SeatCommand {
         if state.layout_revision != g.layout {
             return Ok(None);
         }
-        let (change, material) = match g.action.evaluate(r, db, &state, &g.actor, u64::MAX) {
-            Ok(pair) => pair,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(e) => return Err(e),
-        };
+        let (change, material) =
+            match g
+                .action
+                .evaluate(r.seat_changes(), db, &state, &g.actor, u64::MAX)
+            {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+                Err(e) => return Err(e),
+            };
         Ok((material == g.material).then_some(change))
     }
     fn committed_receipt(&self, db: &Connection) -> io::Result<Option<Vec<u8>>> {
@@ -550,6 +557,21 @@ pub struct LobbySeatView {
     pub seats: Vec<LobbySeat>,
     pub layout_revision: u64,
     pub setup_revision: u64,
+}
+
+impl LobbySeatView {
+    /// Seats run leftward in physical order. The Auditor is the first occupied seat to the right.
+    pub fn auditor_for(&self, player: &[u8]) -> Option<&[u8]> {
+        let position = self
+            .seats
+            .iter()
+            .position(|s| s.occupant.as_deref() == Some(player))?;
+        self.seats[..position]
+            .iter()
+            .rev()
+            .chain(self.seats[position + 1..].iter().rev())
+            .find_map(|seat| seat.occupant.as_deref())
+    }
 }
 
 fn local_request_key(node: ReplicaId, request: [u8; 16]) -> String {
@@ -716,7 +738,7 @@ impl GameNode {
         r.verify_replay(&db)?;
         member(&db, actor, u64::MAX)?;
         let state = layout_at(&db, u64::MAX)?;
-        let mut seats = Snapshot::at(r, &db, &state, u64::MAX)?.view();
+        let mut seats = Snapshot::at(r.seat_changes(), &db, &state, u64::MAX)?.view();
         if r.lobby_format.is_some_and(lobby::LobbyFormat::preferences) {
             for s in &mut seats {
                 if let Some(a) = &s.occupant {
@@ -769,9 +791,9 @@ impl GameNode {
         r.verify_replay(&db)?;
         let k = store::meta::<LogId>(&db, "applied")?.ok_or(invalid("missing lobby checkpoint"))?;
         let (node, _) = member(&db, actor, k.index)?;
-        action.guard_tags(r)?;
+        action.guard_tags(r.lobby_format.ok_or(invalid("missing lobby profile"))?)?;
         let state = layout_at(&db, k.index)?;
-        let (_, material) = action.evaluate(r, &db, &state, actor, k.index)?;
+        let (_, material) = action.evaluate(r.seat_changes(), &db, &state, actor, k.index)?;
         Ok(SeatCommandGuard {
             profile: r.profile().into(),
             session: r.session.clone(),

@@ -121,11 +121,11 @@ impl LobbyIntent {
         peer: ReplicaId,
     ) -> io::Result<(&[u8], [u8; 16], LobbyPreference)> {
         let db = r.lock()?;
-        self.authenticate_at(r, &db, peer, u64::MAX)
+        self.authenticate_at(&r.session, &db, peer, u64::MAX)
     }
     pub(in crate::seating) fn authenticate_at(
         &self,
-        r: &Replica,
+        session: &[u8],
         db: &Connection,
         peer: ReplicaId,
         index: u64,
@@ -137,7 +137,7 @@ impl LobbyIntent {
         let body = fields(env[&1], &[1, 2, 3, 4, 5])?;
         let request: [u8; 16] = body[&4].try_into().map_err(io::Error::other)?;
         if body[&1] != b"setup-guard-request/v1"
-            || body[&2] != r.session
+            || body[&2] != session
             || request[6] >> 4 != 4
             || request[8] >> 6 != 2
         {

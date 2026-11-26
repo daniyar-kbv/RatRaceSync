@@ -153,6 +153,10 @@ impl PromotionAuthority {
                 signer,
             });
         }
+        // A partitioned installation may retain the old effective configuration after
+        // receiving its local Leave confirmation. Fence cached proofs at signing time.
+        let db = r.lock()?;
+        seating::departure::reject_departed(&db, sender, None)?;
         Ok(Some(signed(&transcript(r, kind, request, &bytes)?, key)))
     }
 }
