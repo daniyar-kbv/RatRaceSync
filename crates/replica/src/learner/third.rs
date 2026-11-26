@@ -294,6 +294,7 @@ impl GameNode {
         r.verify_replay(&db)?;
         route.verify_historical_join(r, &db, route.join)?;
         require_open_place(&db)?;
+        seating::departure::reject_departed(&db, route.joined, None)?;
         Ok(signed(&support(raw), key))
     }
     /// Add only a replication target. The two-member voting quorum stays intact.

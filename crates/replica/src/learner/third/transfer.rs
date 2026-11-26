@@ -28,6 +28,11 @@ fn report(
     {
         return Err(invalid("not an eligible recovery donor"));
     }
+    seating::departure::reject_departed(
+        &db,
+        r.local_node.ok_or(invalid("missing recovery donor"))?,
+        Some(route.learner),
+    )?;
     r.require_lobby_genesis(&db)?;
     route.check_member(&db)?;
     let m = history::membership(&db)?;

@@ -69,6 +69,7 @@ async fn last_guest(
     let a = host.leave_approval(&cmd, &key()).unwrap();
     let b = guest.node.leave_approval(&cmd, identity).unwrap();
     assert!(host.leave_lobby(&cmd, [&a, &a]).await.is_err());
+    guest.node.raft.runtime_config().elect(false);
     let route = bus.1.lock().unwrap().remove(&guest.id()).unwrap();
     assert!(!matches!(
         timeout(Duration::from_millis(400), host.leave_lobby(&cmd, [&a, &b])).await,
@@ -80,6 +81,11 @@ async fn last_guest(
         high
     );
     bus.1.lock().unwrap().insert(guest.id(), route);
+    // Confirmation must also retire an installation that never applies Leave.
+    *bus.6.lock().unwrap() = Some(PausedReplication {
+        command: cmd.0.clone(),
+        attempted: Default::default(),
+    });
     let receipt = host.leave_lobby(&cmd, [&a, &b]).await.unwrap();
     assert_eq!(
         host.raft.voter_ids().collect::<Vec<_>>(),
@@ -202,6 +208,18 @@ async fn last_guest_leaves_original_pair_with_quorum_and_recovers_after_restart(
             .index(),
         before.index
     );
+    let original_entry: Vec<u8> = p
+        .game
+        .node
+        .replica
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT entry FROM raft_log WHERE idx=?",
+            [before.index.to_be_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
     let guest_id = p.learner.id();
     let session = p.game.session.clone();
     p.shutdown().await;
@@ -213,6 +231,47 @@ async fn last_guest_leaves_original_pair_with_quorum_and_recovers_after_restart(
         root.path()
             .join("receiver")
             .join(format!("learner-{guest_id}-g1.sqlite")),
+    )
+    .unwrap();
+    let observed = crate::learner::history::boundary(&db).unwrap();
+    assert!(observed.index < before.index);
+    db.execute(
+        "INSERT INTO raft_log(idx,entry) VALUES(?,?)",
+        rusqlite::params![before.index.to_be_bytes(), original_entry],
+    )
+    .unwrap();
+    store::put(&db, "committed", &Some(before)).unwrap();
+    store::put(&db, "applied", &before).unwrap();
+    assert!(
+        catalog.departure_receipt(&session).is_err(),
+        "a reserved request masked a missing applied Leave"
+    );
+    store::put(&db, "applied", &observed).unwrap();
+    store::put(&db, "committed", &Some(observed)).unwrap();
+    db.execute(
+        "DELETE FROM raft_log WHERE idx=?",
+        [before.index.to_be_bytes()],
+    )
+    .unwrap();
+    let saved_digest: Vec<u8> = db
+        .query_row(
+            "SELECT digest FROM archive WHERE idx=?",
+            [observed.index.to_be_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE archive SET digest=zeroblob(32) WHERE idx=?",
+        [observed.index.to_be_bytes()],
+    )
+    .unwrap();
+    assert!(
+        catalog.departure_receipt(&session).is_err(),
+        "changed observation returned an offline Leave receipt"
+    );
+    db.execute(
+        "UPDATE archive SET digest=? WHERE idx=?",
+        rusqlite::params![saved_digest, observed.index.to_be_bytes()],
     )
     .unwrap();
     let joined = store::meta::<JoinedMember>(&db, "first_member")
@@ -316,11 +375,96 @@ async fn last_guest_preserves_a_registered_nonvoting_learner() {
     let roster =
         crate::learner::history::membership(&r.p.game.node.replica.lock().unwrap()).unwrap();
     assert!(roster.membership().non_write_voter_ids().eq([r.third.id()]));
+    let old_route = store::meta::<Vec<u8>>(
+        &r.third.node.replica.lock().unwrap(),
+        "local_recovery_route",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        r.p.learner
+            .node
+            .confirm_recovery_support(&old_route, &r.p.identity)
+            .is_err(),
+        "retired voter signed learner admission support"
+    );
+    let challenge = r.third.request(&r.identity).unwrap();
+    assert!(
+        r.p.learner
+            .node
+            .voter_recovery_chunk(&challenge, &r.p.identity, async |_| panic!(
+                "archive piece contacted peer"
+            ))
+            .await
+            .is_err(),
+        "retired donor served an archive piece"
+    );
     assert!(r.third.joined_node().is_err());
     r.third.shutdown().await.unwrap();
     r.p.shutdown().await;
     drop(r);
     restart_creator(root.path(), &cmd, &receipt, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_guest_cannot_sign_a_prepared_promotion_after_release() {
+    let root = tempfile::tempdir().unwrap();
+    let pair = finish_pair(Peers::with_profile(root.path(), 3, LobbyFormat::LastGuest).await).await;
+    let mut r = admit_to_pair(root.path(), pair).await;
+    r.recover().await;
+    let host = &r.p.game.node;
+    let guest = &r.p.learner;
+    let mut prepared = None;
+    r.catalog
+        .prepare_third_join(
+            &r.third,
+            &r.identity,
+            REQUEST,
+            true,
+            async |draft, route| {
+                let proofs = [
+                    host.confirm_third_promotion(&draft, &route, &key())?,
+                    guest
+                        .node
+                        .confirm_third_promotion(&draft, &route, &r.p.identity)?,
+                ];
+                prepared = Some((draft, route));
+                Ok(proofs)
+            },
+        )
+        .await
+        .unwrap();
+    let (draft, route) = prepared.unwrap();
+    let witness = host.leave_lobby_witness(&guest.actor).await.unwrap();
+    let cmd = guest
+        .node
+        .prepare_leave_lobby(&guest.actor, &witness, request(181), &r.p.identity)
+        .unwrap();
+    let a = host.leave_approval(&cmd, &key()).unwrap();
+    let b = guest.node.leave_approval(&cmd, &r.p.identity).unwrap();
+    guest.node.raft.runtime_config().elect(false);
+    *r.p.bus.6.lock().unwrap() = Some(PausedReplication {
+        command: cmd.0.clone(),
+        attempted: Default::default(),
+    });
+    host.leave_lobby(&cmd, [&a, &b]).await.unwrap();
+    let k = crate::learner::history::boundary(&host.replica.lock().unwrap()).unwrap();
+    host.reconcile_voting_history(k, &key(), async |_| panic!("unexpected peer"))
+        .await
+        .unwrap();
+    let confirmation = host.leave_confirmation(&cmd, &key()).unwrap();
+    r.p.catalog
+        .finish_lobby_leave(guest, &cmd, [&confirmation, &[]])
+        .unwrap();
+    assert!(
+        guest
+            .node
+            .confirm_third_promotion(&draft, &route, &r.p.identity)
+            .is_err(),
+        "retired guest signed a pending promotion"
+    );
+    r.third.shutdown().await.unwrap();
+    r.p.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -79,6 +79,15 @@ impl GameNode {
         if !self.voting_history_complete(high)? {
             return Err(invalid("predecessor handoff pending"));
         }
+        let db = r.lock()?;
+        seating::departure::reject_departed(
+            &db,
+            r.local_node.ok_or(invalid("missing promotion signer"))?,
+            None,
+        )?;
+        if history::boundary(&db)? != high {
+            return Err(invalid("promotion checkpoint changed before signing"));
+        }
         Ok(signed(&intent.support(), key))
     }
 }

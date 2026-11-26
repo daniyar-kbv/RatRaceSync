@@ -144,6 +144,27 @@ impl GameNode {
         Ok(message(&[(1, &body), (2, &key.sign(&body).to_bytes())]))
     }
 }
+fn retained_entry(db: &Connection, log: &[u8; 32]) -> io::Result<Entry> {
+    let (bytes, source, digest): (Vec<u8>, Vec<u8>, [u8; 32]) = db
+        .query_row(
+            "SELECT l.entry,a.source,a.digest FROM raft_log l JOIN archive a USING(idx)
+         WHERE a.log_id=? AND a.idx=?",
+            params![log, &log[24..]],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(io::Error::other)?;
+    let entry: Entry = store::decode(&bytes)?;
+    if log_key(entry.log_id).as_slice() != log
+        || entry.payload.bytes != source
+        || Sha256::digest(&source)[..] != digest
+    {
+        return Err(invalid(
+            "retained entry differs from signed Leave checkpoint",
+        ));
+    }
+    Ok(entry)
+}
+
 fn verify_predecessor(
     db: &Connection,
     guard: &SeatCommandGuard,
@@ -152,11 +173,7 @@ fn verify_predecessor(
     let Dependencies::Membership { configuration, .. } = guard.material else {
         return Err(invalid("missing predecessor membership reference"));
     };
-    let (retained, source, digest): (Vec<u8>,Vec<u8>,[u8;32]) = db.query_row(
-        "SELECT l.entry,a.source,a.digest FROM raft_log l JOIN archive a USING(idx) WHERE a.log_id=?",
-        [configuration], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
-    ).map_err(io::Error::other)?;
-    let entry: Entry = store::decode(&retained)?;
+    let entry = retained_entry(db, &configuration)?;
     let voters = entry
         .payload
         .check_members()?
@@ -171,11 +188,7 @@ fn verify_predecessor(
         ],
         voters.non_write_voter_ids(),
     );
-    if voters != expected
-        || log_key(entry.log_id) != configuration
-        || entry.payload.bytes != source
-        || Sha256::digest(&source)[..] != digest
-    {
+    if voters != expected {
         return Err(invalid("retained predecessor differs from signed Leave"));
     }
     Ok(())
@@ -201,14 +214,7 @@ impl Evidence {
         }
         let request = intent.request;
         let fingerprint = guard.fingerprint(&request);
-        let index: [u8; 8] = db
-            .query_row(
-                "SELECT idx FROM archive WHERE log_id=?",
-                [guard.observed],
-                |row| row.get(0),
-            )
-            .map_err(io::Error::other)?;
-        let index = u64::from_be_bytes(index);
+        let index = retained_entry(db, &guard.observed)?.log_id.index;
         let first = fields(&self.confirmations[0], &[1, 2])?;
         let body = fields(first[&1], &[1, 2, 3, 4, 5])?;
         let receipt = body[&5];
@@ -238,10 +244,28 @@ impl Evidence {
             )
             .optional()
             .map_err(io::Error::other)?;
-        let original = match applied {
-            Some(bytes) if bytes == receipt => archived_seat_command(db, &bytes)?,
-            Some(_) => return Err(invalid("confirmed departure differs from local receipt")),
-            None => store::meta::<Signed>(db, &local_request_key(local, request))?,
+        let local_tip = store::meta::<LogId>(db, "applied")?
+            .ok_or(invalid("missing local applied boundary"))?;
+        let original = if local_tip.index.to_be_bytes().as_slice() >= &effective[24..] {
+            if applied.as_deref() != Some(receipt) {
+                return Err(invalid("applied departure differs from confirmed receipt"));
+            }
+            let entry = retained_entry(db, effective)?;
+            if Sha256::digest(&entry.payload.bytes)[..] != *record[&9] {
+                return Err(invalid(
+                    "applied Leave source differs from confirmed receipt",
+                ));
+            }
+            let packet = entry
+                .payload
+                .leave_source()?
+                .ok_or(invalid("missing applied Leave source"))?;
+            Some(Signed(fields(packet, &[1, 2, 3, 4])?[&2].to_vec()))
+        } else {
+            if applied.is_some() {
+                return Err(invalid("departure receipt beyond applied boundary"));
+            }
+            store::meta::<Signed>(db, &local_request_key(local, request))?
         };
         let reserved = verify(&original.ok_or(invalid("missing local Leave command"))?)?;
         if reserved.request != request || reserved.guard.fingerprint(&request) != fingerprint {
