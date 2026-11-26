@@ -441,8 +441,12 @@ impl Intent<'_> {
                 route.verify_historical_join(r, db, member.log_id)?;
                 let departure = seating::departure::last_guest_at(db, u64::MAX)?
                     .ok_or(invalid("missing singleton departure"))?;
+                let registered = match route.departure {
+                    Some(left) => left == departure.log_id && route.is_registered(db, creator)?,
+                    None => prior == departure.log_id,
+                };
                 if departure.node != member.node
-                    || prior != departure.log_id
+                    || !registered
                     || route.admission != self.admission
                     || self.approvals.is_some()
                 {

@@ -28,19 +28,51 @@ impl ThirdJoinTransport for CreatorTransport<'_> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
-    let root = tempfile::tempdir().unwrap();
-    let pair = finish_pair(Peers::with_profile(root.path(), 3, LobbyFormat::LastGuest).await).await;
-    let mut r = admit_to_pair(root.path(), pair).await;
-    let host = &r.p.game.node;
-    let id = r.third.id();
-    let (original_leave, leave) = last_guest(
-        host,
-        &r.p.learner,
-        &r.p.identity,
-        &mut r.p.catalog,
-        &r.p.bus,
+    exercise_replacement(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn freshly_registered_learner_joins_and_recovers_original_receipt() {
+    exercise_replacement(true).await;
+}
+
+async fn admit_after_leave(
+    root: &Path,
+    mut p: Peers,
+    first: JoinResult,
+) -> (Recovery, (Signed, Vec<u8>)) {
+    let leave = last_guest(
+        &p.game.node,
+        &p.learner,
+        &p.identity,
+        &mut p.catalog,
+        &p.bus,
     )
     .await;
+    p.bus.6.lock().unwrap().take();
+    (admit_third(root, (p, first), true).await, leave)
+}
+
+async fn exercise_replacement(after_leave: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let (p, first) =
+        finish_pair(Peers::with_profile(root.path(), 3, LobbyFormat::LastGuest).await).await;
+    let (mut r, (original_leave, leave)) = if after_leave {
+        admit_after_leave(root.path(), p, first).await
+    } else {
+        let mut r = admit_to_pair(root.path(), (p, first)).await;
+        let leave = last_guest(
+            &r.p.game.node,
+            &r.p.learner,
+            &r.p.identity,
+            &mut r.p.catalog,
+            &r.p.bus,
+        )
+        .await;
+        (r, leave)
+    };
+    let host = &r.p.game.node;
+    let id = r.third.id();
     r.p.bus.6.lock().unwrap().take();
     assert!(
         r.catalog
@@ -140,19 +172,48 @@ async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
             &r.identity,
             request_id,
             true,
-            async |q| host.join_lobby(&q).await,
+            async |q| {
+                let original = host.join_lobby(&q).await?;
+                assert_eq!(original, join);
+                if after_leave {
+                    return Err(io::ErrorKind::ConnectionReset.into());
+                }
+                Ok(original)
+            },
             async |_| Err(io::ErrorKind::ConnectionReset.into()),
         )
-        .await
-        .unwrap();
-    assert_eq!(pending.join, join);
-    assert!(pending.history.is_err());
+        .await;
+    if after_leave {
+        assert_eq!(
+            pending.err().unwrap().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    } else {
+        let pending = pending.unwrap();
+        assert_eq!(pending.join, join);
+        assert!(pending.history.is_err());
+    }
     assert!(!host.voting_history_complete(join.log_id).unwrap());
     let only = host.sign_voting_checkpoint(join.log_id, &key()).unwrap();
     assert!(
         host.store_voting_checkpoint(join.log_id, &only, &only, &key())
             .is_err()
     );
+    let evidence = |db: &rusqlite::Connection, k: LogId| -> Vec<u8> {
+        db.query_row(
+            "SELECT certificate FROM historic_seal WHERE idx=?",
+            [k.index.to_be_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let predecessor_proofs = {
+        let db = host.replica.lock().unwrap();
+        let left = crate::seating::departure::last_guest_at(&db, join.log_id.index)
+            .unwrap()
+            .unwrap();
+        [r.join.log_id, left.log_id, r.admitted].map(|k| (k, evidence(&db, k)))
+    };
     let view = host.lobby_seating(&r.third.actor).await.unwrap();
     assert!(view.seats[1].occupant.is_none() && !view.seats[1].ready);
     r.third.shutdown().await.unwrap();
@@ -162,6 +223,28 @@ async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
     let bus = Bus::default();
     let mut hc = InstallationCatalog::open(&root.path().join("creator")).unwrap();
     let mut lc = InstallationCatalog::open(&root.path().join("third")).unwrap();
+    if after_leave {
+        let (registration, cert) = &predecessor_proofs[2];
+        let path = root
+            .path()
+            .join("creator")
+            .join(format!("game-{}-g1.sqlite", join.log_id.leader_id.node_id));
+        let db = rusqlite::Connection::open(path).unwrap();
+        let idx = registration.index.to_be_bytes();
+        db.execute("DELETE FROM historic_seal WHERE idx=?", [idx])
+            .unwrap();
+        assert!(
+            hc.open_active(Config::default(), bus.clone())
+                .await
+                .is_err(),
+            "creator resumed voting without the registration certificate covered by Join"
+        );
+        db.execute(
+            "INSERT INTO historic_seal(idx,certificate) VALUES(?,?)",
+            rusqlite::params![idx, cert],
+        )
+        .unwrap();
+    }
     let game = hc
         .open_active(Config::default(), bus.clone())
         .await
@@ -224,6 +307,24 @@ async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
     for node in [game.node.as_ref(), learner.joined_node().unwrap()] {
         assert!(node.voting_history_complete(join.log_id).unwrap());
         let db = node.replica.lock().unwrap();
+        for (k, certificate) in &predecessor_proofs {
+            assert_eq!(&evidence(&db, *k), certificate);
+        }
+        let (added_events, added_receipts, entry): (i64, i64, Vec<u8>) = db
+            .query_row(
+                "SELECT a.event_count-p.event_count,a.receipt_count-p.receipt_count,l.entry
+             FROM archive a JOIN raft_log l USING(idx) JOIN archive p ON p.idx=? WHERE a.idx=?",
+                rusqlite::params![
+                    (join.log_id.index - 1).to_be_bytes(),
+                    join.log_id.index.to_be_bytes()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((added_events, added_receipts), (1, 1));
+        let entry = store::decode::<Entry>(&entry).unwrap();
+        assert_eq!(entry.log_id, join.log_id);
+        assert_eq!(entry.payload.join_command().unwrap(), Some(raw.as_slice()));
         let count: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM receipt WHERE record IN (?,?)",
@@ -261,7 +362,6 @@ async fn retained_replacement_join_recovers_with_its_original_learner_consent() 
     r.recover().await;
     let obsolete = r.proposal().await.unwrap();
     let host = &r.p.game.node;
-    let id = r.third.id();
     last_guest(
         host,
         &r.p.learner,
@@ -272,6 +372,21 @@ async fn retained_replacement_join_recovers_with_its_original_learner_consent() 
     .await;
     r.p.bus.6.lock().unwrap().take();
     assert!(host.join_lobby(&obsolete).await.is_err());
+    exercise_pending_restart(root, r).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn freshly_registered_learner_resumes_pending_join_after_both_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (p, first) =
+        finish_pair(Peers::with_profile(root.path(), 2, LobbyFormat::LastGuest).await).await;
+    let (r, _) = admit_after_leave(root.path(), p, first).await;
+    exercise_pending_restart(root, r).await;
+}
+
+async fn exercise_pending_restart(root: tempfile::TempDir, mut r: Recovery) {
+    let host = &r.p.game.node;
+    let id = r.third.id();
     let k = crate::learner::history::boundary(&host.replica.lock().unwrap()).unwrap();
     r.third
         .node
@@ -404,6 +519,16 @@ async fn retained_replacement_join_recovers_with_its_original_learner_consent() 
     assert_eq!(Some(result.join.log_id), *pending.log_id());
     result.history.unwrap();
     assert_eq!(game.node.join_lobby(&raw).await.unwrap(), result.join);
+    game.node.raft.runtime_config().elect(false);
+    game.node.raft.runtime_config().heartbeat(false);
+    let successor = learner.joined_node().unwrap();
+    successor
+        .raft
+        .wait(Some(Duration::from_secs(8)))
+        .state(openraft::ServerState::Leader, "new voter elected")
+        .await
+        .unwrap();
+    assert_eq!(successor.join_lobby(&raw).await.unwrap(), result.join);
     learner.shutdown().await.unwrap();
     game.node.raft.shutdown().await.unwrap();
 }

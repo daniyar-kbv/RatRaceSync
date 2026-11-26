@@ -36,7 +36,10 @@ async fn finish_pair(mut p: Peers) -> (Peers, JoinResult) {
 async fn admitted_third(root: &Path) -> Recovery {
     admit_to_pair(root, joined_pair(root, 4).await).await
 }
-async fn admit_to_pair(root: &Path, (p, join): (Peers, JoinResult)) -> Recovery {
+async fn admit_to_pair(root: &Path, pair: (Peers, JoinResult)) -> Recovery {
+    admit_third(root, pair, false).await
+}
+async fn admit_third(root: &Path, (p, join): (Peers, JoinResult), after_leave: bool) -> Recovery {
     let host = &*p.game.node;
     let other = &p.learner.node;
     let path = root.join("third");
@@ -76,8 +79,13 @@ async fn admit_to_pair(root: &Path, (p, join): (Peers, JoinResult)) -> Recovery 
         .lock()
         .unwrap()
         .insert(third.id(), (p.game.creator_node, third.replication()));
-    let confirmation = other.confirm_recovery_support(&route, &p.identity).unwrap();
-    assert!(host.admit_recovery_learner(&route, &[]).await.is_err());
+    let confirmation = if after_leave {
+        assert!(other.confirm_recovery_support(&route, &p.identity).is_err());
+        Vec::new()
+    } else {
+        assert!(host.admit_recovery_learner(&route, &[]).await.is_err());
+        other.confirm_recovery_support(&route, &p.identity).unwrap()
+    };
     let admitted = host
         .admit_recovery_learner(&route, &confirmation)
         .await
@@ -88,7 +96,7 @@ async fn admit_to_pair(root: &Path, (p, join): (Peers, JoinResult)) -> Recovery 
             .await
             .unwrap()
     );
-    for node in [other, &third.node] {
+    for node in std::iter::once(&third.node).chain((!after_leave).then_some(other)) {
         node.raft
             .wait(Some(Duration::from_secs(6)))
             .applied_index_at_least(Some(admitted.index), "nonvoting replication")

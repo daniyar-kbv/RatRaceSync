@@ -19,7 +19,11 @@ impl RecoveryRoute {
         }
         Ok(())
     }
-    pub(super) fn is_registered(&self, db: &Connection, creator: &Creator) -> io::Result<bool> {
+    pub(in crate::learner) fn is_registered(
+        &self,
+        db: &Connection,
+        creator: &Creator,
+    ) -> io::Result<bool> {
         let entry = history::membership_entry(db, u64::MAX, true)?
             .ok_or(invalid("missing membership source"))?;
         Ok(entry

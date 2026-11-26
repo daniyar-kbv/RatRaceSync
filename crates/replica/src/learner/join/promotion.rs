@@ -103,7 +103,22 @@ impl Replica {
         let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
         let applied =
             store::meta::<LogId>(db, "applied")?.ok_or(invalid("missing applied boundary"))?;
-        let mut promoted = store::meta::<JoinedMember>(db, "third_member")?.is_some();
+        let third = store::meta::<JoinedMember>(db, "third_member")?;
+        if let Some(member) = &third
+            && seating::departure::last_guest_at(db, member.log_id.index)?.is_some()
+        {
+            // Replaying the applied command checks its effects. Reopening a voter
+            // also requires the retained certificates covered by the signed Join.
+            let entry = history::membership_entry(db, member.log_id.index, true)?
+                .filter(|e| e.log_id == member.log_id)
+                .ok_or(invalid("missing applied replacement Join"))?;
+            let raw = entry
+                .payload
+                .join_command()?
+                .ok_or(invalid("missing replacement Join source"))?;
+            self.verify_join_coverage(db, raw)?;
+        }
+        let mut promoted = third.is_some();
         let mut query = db
             .prepare("SELECT idx,entry FROM raft_log WHERE idx>? ORDER BY idx")
             .map_err(io::Error::other)?;

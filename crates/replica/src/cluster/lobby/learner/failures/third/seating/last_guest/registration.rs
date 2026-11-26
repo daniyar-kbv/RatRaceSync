@@ -54,13 +54,23 @@ async fn fresh_registration_after_leave_races_and_recovers_its_historical_prefix
     let winner = usize::from(b.is_ok());
     let registered = a.or(b).unwrap();
     let (path, mut catalog, identity, mut learner, route) = candidates.swap_remove(winner);
-    let (_, losing_catalog, _, loser, losing_route) = candidates.pop().unwrap();
+    let (_, losing_catalog, losing_identity, loser, losing_route) = candidates.pop().unwrap();
     assert!(
         host.admit_recovery_learner(&losing_route, &[])
             .await
             .is_err()
     );
     assert!(losing_catalog.active_pin().unwrap().is_none());
+    assert!(
+        losing_catalog
+            .prepare_join(&loser, &losing_identity, REQUEST, true)
+            .is_err()
+    );
+    assert!(
+        p.catalog
+            .prepare_join(&p.learner, &p.identity, super::request(91), true)
+            .is_err()
+    );
     loser.shutdown().await.unwrap();
     let id = learner.id();
     assert_eq!(
@@ -256,11 +266,30 @@ async fn fresh_registration_after_leave_races_and_recovers_its_historical_prefix
     assert_eq!(catalog.recovered_lobby(&learner).unwrap(), Some(lobby));
     assert!(learner.joined_node().is_err());
     let host = &game.node;
+    let pending_join = catalog
+        .prepare_join(&learner, &identity, super::request(92), true)
+        .unwrap();
+    // A current command guard cannot revive a signed route from before Leave.
+    let outer = fields(&pending_join, &[1, 2]).unwrap();
+    let signed_guard = fields(outer[&2], &[1, 2]).unwrap();
+    let mut guard = fields(signed_guard[&1], &[1, 2, 3, 4, 5]).unwrap();
+    guard.insert(5, &stale_route);
+    let body = message(&guard.into_iter().collect::<Vec<_>>());
+    let signature = identity.sign(&body).to_bytes();
+    let stale = message(&[
+        (1, outer[&1]),
+        (2, &message(&[(1, &body), (2, &signature)])),
+    ]);
+    assert!(host.join_lobby(&stale).await.is_err());
+    assert!(host.raft.voter_ids().eq([game.creator_node]));
     let witness = host.cancellation_witness(ACTOR).await.unwrap();
     let cancel = host
         .prepare_cancellation(ACTOR, &witness, super::request(90), &key())
         .unwrap();
     let cancelled = super::receipt(host.submit(cancel).await.unwrap());
+    assert!(host.join_lobby(&pending_join).await.is_err());
+    assert!(host.raft.voter_ids().eq([game.creator_node]));
+    assert!(learner.joined_node().is_err());
     host.certify_recovery_tail(&key(), async |_| panic!("retired voter"))
         .await
         .unwrap();
