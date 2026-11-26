@@ -20,7 +20,7 @@ pub(super) fn commit(
         .ok_or(invalid("setup revision overflow"))?;
     let layout = g.layout.to_be_bytes();
     let prior_ready = [u8::from(
-        r.lobby_format == Some(lobby::LobbyFormat::DreamReady)
+        r.lobby_format.is_some_and(lobby::LobbyFormat::preferences)
             && preference::effective(db, &g.actor, index)?.ready,
     )];
     let ready = message(&[(1, &prior_ready), (2, &[0])]);

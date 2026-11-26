@@ -433,6 +433,9 @@ impl Replica {
             )?;
             Reply::Receipt(receipt)
         } else if let Some(m) = e.payload.check_members()? {
+            if self.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+                seating::cancellation::require_open(tx, u64::MAX)?;
+            }
             let mut stmt = tx
                 .prepare("SELECT node FROM participant ORDER BY node")
                 .map_err(io::Error::other)?;

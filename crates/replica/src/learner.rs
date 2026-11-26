@@ -16,7 +16,9 @@ pub use join::{JoinDelivery, JoinResult, JoinedMember, PromotionAuthority, Third
 pub use quorum::VotingHistoryRequest;
 mod installation;
 mod sealing;
-pub(crate) use installation::check_inventory;
+pub(crate) use installation::{
+    cancellation_generation, check_cancellation_binding, check_inventory, create_learner_table,
+};
 pub(crate) use sealing::SealWorker;
 
 const INVITE: &[u8] = b"RatRaceSync/learner/invitation/1";
@@ -67,6 +69,7 @@ pub(crate) fn invitation(
         lobby::LobbyFormat::SeatChanges,
         lobby::LobbyFormat::Resizable,
         lobby::LobbyFormat::DreamReady,
+        lobby::LobbyFormat::Cancellable,
     ]
     .into_iter()
     .find(|f| body[&11] == genesis::profile_manifest(f.profile()))
@@ -397,6 +400,10 @@ impl CreatorGame {
         }
         let db = r.lock()?;
         r.require_lobby_genesis(&db)?;
+        if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+            r.verify_replay(&db)?;
+            seating::cancellation::require_open(&db, u64::MAX)?;
+        }
         let proof = store::meta::<SignedGenesis>(&db, "signed_genesis")?
             .ok_or(invalid("missing genesis"))?;
         Ok(message(&[
@@ -415,7 +422,7 @@ impl CreatorGame {
             .await
             .map_err(io::Error::other)?;
         let r = &self.node.replica;
-        let id = {
+        let (id, conditional) = {
             let mut db = r.lock()?;
             let tx = db.transaction().map_err(io::Error::other)?;
             r.require_lobby_genesis(&tx)?;
@@ -430,6 +437,10 @@ impl CreatorGame {
                 return Err(invalid(
                     "learner admission requires the original lobby host",
                 ));
+            }
+            if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+                r.verify_replay(&tx)?;
+                seating::cancellation::require_open(&tx, u64::MAX)?;
             }
             let f = admission_fields(r, admission, &creator)?;
             let id = ReplicaId(fixed(f[&6])?);
@@ -448,12 +459,45 @@ impl CreatorGame {
             if !present && m.membership().non_write_voter_ids().next().is_some() {
                 return Err(invalid("different learner already registered"));
             }
+            let conditional = if !present && r.lobby_format == Some(lobby::LobbyFormat::Cancellable)
+            {
+                Some((
+                    Members::new_with_defaults(m.membership().get_joint_config().clone(), [id]),
+                    history::boundary(&tx)?,
+                    m.log_id().ok_or(invalid("missing membership"))?,
+                ))
+            } else {
+                None
+            };
             tx.commit().map_err(io::Error::other)?;
             if present {
                 return Ok(());
             }
-            id
+            (id, conditional)
         };
+        if let Some((target, high, prior)) = conditional {
+            use openraft::{entry::RaftPayload, raft::Precondition};
+            self.node
+                .raft
+                .append_membership(
+                    target,
+                    Source::blank(),
+                    [
+                        Precondition::CommittedLeaderId {
+                            committed_leader_id: high.leader_id,
+                        },
+                        Precondition::LastLogId {
+                            last_log_id: Some(high),
+                        },
+                        Precondition::LastMembershipLogId {
+                            last_membership_log_id: Some(prior),
+                        },
+                    ],
+                )
+                .await
+                .map_err(io::Error::other)?;
+            return Ok(());
+        }
         self.node
             .raft
             .add_learner(id, (), false)

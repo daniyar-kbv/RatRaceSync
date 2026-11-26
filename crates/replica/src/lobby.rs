@@ -18,6 +18,7 @@ pub(crate) enum LobbyFormat {
     SeatChanges,
     Resizable,
     DreamReady,
+    Cancellable,
 }
 
 impl LobbyFormat {
@@ -27,19 +28,30 @@ impl LobbyFormat {
     pub(crate) fn seating(self) -> bool {
         matches!(
             self,
-            Self::Seating | Self::SeatChanges | Self::Resizable | Self::DreamReady
+            Self::Seating
+                | Self::SeatChanges
+                | Self::Resizable
+                | Self::DreamReady
+                | Self::Cancellable
         )
     }
     pub(crate) fn seat_history(self) -> bool {
-        matches!(self, Self::SeatChanges | Self::Resizable | Self::DreamReady)
+        matches!(
+            self,
+            Self::SeatChanges | Self::Resizable | Self::DreamReady | Self::Cancellable
+        )
     }
     pub(crate) fn resizable(self) -> bool {
-        matches!(self, Self::Resizable | Self::DreamReady)
+        matches!(self, Self::Resizable | Self::DreamReady | Self::Cancellable)
+    }
+    pub(crate) fn preferences(self) -> bool {
+        matches!(self, Self::DreamReady | Self::Cancellable)
     }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::Cancellable => b"RatRaceSync/Classic101/lobby/v7",
             Self::DreamReady => b"RatRaceSync/Classic101/lobby/v6",
             Self::Resizable => b"RatRaceSync/Classic101/lobby/v5",
             Self::SeatChanges => b"RatRaceSync/Classic101/lobby/v4",
@@ -54,6 +66,7 @@ impl LobbyFormat {
             Self::SeatChanges,
             Self::Resizable,
             Self::DreamReady,
+            Self::Cancellable,
         ]
         .into_iter()
         .find(|f| f.profile() == bytes)
@@ -76,6 +89,7 @@ pub struct CreateLobby<'a> {
 #[repr(i32)]
 pub enum LobbyStage {
     Open = 1,
+    Cancelled = 2,
 }
 
 /// Original committed LobbyCreated facts. Seats are in physical order and
@@ -411,7 +425,8 @@ impl Replica {
             | LobbyFormat::Seating
             | LobbyFormat::SeatChanges
             | LobbyFormat::Resizable
-            | LobbyFormat::DreamReady => {
+            | LobbyFormat::DreamReady
+            | LobbyFormat::Cancellable => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();

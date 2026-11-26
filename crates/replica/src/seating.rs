@@ -1,4 +1,5 @@
 //! Signed seat commands against committed, public lobby occupancy.
+pub(crate) mod cancellation;
 mod effect;
 mod preference;
 pub use preference::{LobbyIntent, LobbyPreference, OwnLobbyPreference, OwnPreferenceRead};
@@ -54,6 +55,13 @@ impl SeatCommandGuard {
         ]);
         match &self.material {
             Dependencies::Occupancy(m) => m.append_guard(&mut bytes),
+            Dependencies::Cancel {
+                setup,
+                configuration,
+            } => {
+                wire::field(&mut bytes, 5, &setup.to_be_bytes());
+                wire::field(&mut bytes, 6, configuration);
+            }
             Dependencies::Resize(setup) => wire::field(&mut bytes, 5, &setup.to_be_bytes()),
             Dependencies::Preference(m) => {
                 wire::field(&mut bytes, 5, &m.setup.to_be_bytes());
@@ -86,6 +94,28 @@ impl SeatCommandGuard {
             return hash(
                 b"player-setup-intent/v1",
                 &[&self.dependency_scope(request, m)],
+            );
+        }
+        if let Dependencies::Cancel {
+            setup,
+            configuration,
+        } = &self.material
+        {
+            return hash(
+                b"cancel-lobby-intent/v1",
+                &[
+                    &self.profile,
+                    &self.session,
+                    &self.actor,
+                    request,
+                    &self.node.0,
+                    &1u64.to_be_bytes(),
+                    &self.observed,
+                    &self.layout.to_be_bytes(),
+                    &setup.to_be_bytes(),
+                    configuration,
+                    &210u16.to_be_bytes(),
+                ],
             );
         }
         if let Dependencies::Resize(setup) = &self.material {
@@ -197,6 +227,7 @@ fn player(actor: &[u8]) -> io::Result<PlayerId> {
 enum TableAction {
     Occupancy(SeatAction),
     Resize(LobbyCapacity),
+    Cancel,
     Preference(LobbyPreference),
 }
 #[derive(Clone, Eq, PartialEq)]
@@ -204,17 +235,22 @@ enum Dependencies {
     Legacy,
     Occupancy(Material),
     Resize(u64),
+    Cancel { setup: u64, configuration: [u8; 32] },
     Preference(preference::Material),
 }
 enum Change {
     Occupancy(SeatAction, SeatTransition),
     Resize(resize::Resize),
+    Cancel,
     Preference(preference::Transition),
 }
 impl TableAction {
     fn guard_tags(self, r: &Replica) -> io::Result<&'static [u32]> {
         match self {
-            Self::Preference(_) if r.lobby_format == Some(lobby::LobbyFormat::DreamReady) => {
+            Self::Cancel if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) => {
+                Ok(&[1, 2, 3, 4, 5, 6])
+            }
+            Self::Preference(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::preferences) => {
                 Ok(&[1, 2, 3, 4, 5, 6, 7])
             }
             Self::Resize(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::resizable) => {
@@ -246,6 +282,18 @@ impl TableAction {
                 Ok((Change::Occupancy(action, tr), material))
             }
             Self::Preference(action) => preference::evaluate(db, &table, actor, index, action),
+            Self::Cancel => {
+                if actor != state.host {
+                    return Err(invalid("only the creator can cancel the lobby"));
+                }
+                Ok((
+                    Change::Cancel,
+                    Dependencies::Cancel {
+                        setup: resize::observed_setup(db, index)?,
+                        configuration: cancellation::configuration_at(db, index)?,
+                    },
+                ))
+            }
             Self::Resize(target) => {
                 if actor != state.host {
                     return Err(invalid("only the lobby host can resize"));
@@ -263,6 +311,7 @@ impl TableAction {
 }
 fn operation(action: TableAction) -> (u32, Option<u8>) {
     match action {
+        TableAction::Cancel => (210, None),
         TableAction::Preference(action) => preference::operation(action),
         TableAction::Resize(target) => (203, Some(target.count())),
         TableAction::Occupancy(SeatAction::Claim(seat)) => (204, Some(seat.get())),
@@ -271,8 +320,12 @@ fn operation(action: TableAction) -> (u32, Option<u8>) {
     }
 }
 fn action(bytes: &[u8]) -> io::Result<TableAction> {
-    for tag in [203, 204, 205, 206, 207, 208] {
+    for tag in [203, 204, 205, 206, 207, 208, 210] {
         if let Ok(operation) = fields(bytes, &[tag]) {
+            if tag == 210 {
+                fields(operation[&tag], &[])?;
+                return Ok(TableAction::Cancel);
+            }
             if tag == 205 {
                 fields(operation[&tag], &[])?;
                 return Ok(TableAction::Occupancy(SeatAction::Release));
@@ -412,6 +465,9 @@ impl SeatCommand {
     }
     fn current(&self, r: &Replica, db: &Connection) -> io::Result<Option<Change>> {
         let g = &self.guard;
+        if cancellation::at(db, u64::MAX)?.is_some() {
+            return Ok(None);
+        }
         let state = layout_at(db, u64::MAX)?;
         if state.layout_revision != g.layout {
             return Ok(None);
@@ -620,7 +676,7 @@ impl GameNode {
         member(&db, actor, u64::MAX)?;
         let state = layout_at(&db, u64::MAX)?;
         let mut seats = Snapshot::at(r, &db, &state, u64::MAX)?.view();
-        if r.lobby_format == Some(lobby::LobbyFormat::DreamReady) {
+        if r.lobby_format.is_some_and(lobby::LobbyFormat::preferences) {
             for s in &mut seats {
                 if let Some(a) = &s.occupant {
                     s.ready = preference::effective(&db, a, u64::MAX)?.ready;
@@ -769,6 +825,7 @@ impl Replica {
                 facts,
             } = match change {
                 Change::Occupancy(action, tr) => effect::commit(self, db, k.index, g, action, tr)?,
+                Change::Cancel => cancellation::commit(self, db, k, &command)?,
                 Change::Resize(plan) => plan.commit(self, db, k.index, g.layout)?,
                 Change::Preference(tr) => preference::commit(self, db, k.index, g, tr)?,
             };
@@ -800,6 +857,7 @@ impl Replica {
                         203 => b"LobbyCapacityChanged/v1",
                         207 => b"DreamSelected/v1",
                         208 => b"ReadyChanged/v1",
+                        210 => b"LobbyCancelled/v1",
                         _ => b"SeatChanged/v1",
                     },
                     self.profile(),

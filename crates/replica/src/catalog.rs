@@ -10,6 +10,9 @@ use rat_race_engine::LobbyCapacity;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::{fs, path::PathBuf, sync::Weak, time::Duration};
 
+pub(crate) mod cancellation;
+pub(crate) use cancellation::{check_new_inventory, has_learner as has_active_learner};
+
 pub struct CreatorGame {
     pub session: Vec<u8>,
     pub fingerprint: [u8; 32],
@@ -83,9 +86,12 @@ impl InstallationCatalog {
                 db.prepare("SELECT request,session,actor,public_key,node,stage,pin FROM participation WHERE slot=1")
                     .map_err(io::Error::other)?;
             }
-            2 | 3 => {
+            2..=4 => {
                 Self::reservation(&db)?;
-                if version == 3 {
+                if version == 4 {
+                    cancellation::check_schema(&db)?;
+                }
+                if cancellation::has_learner(&db)? {
                     crate::learner::check_inventory(&db)?;
                 }
             }
@@ -117,14 +123,16 @@ impl InstallationCatalog {
             )
             .map_err(io::Error::other)?;
         }
-        Ok(Self {
+        let mut catalog = Self {
             directory,
             db,
             _writer: writer,
             running: Weak::new(),
             #[cfg(test)]
             crash_stage: 0,
-        })
+        };
+        catalog.resume_cancellation()?;
+        Ok(catalog)
     }
     fn reservation(db: &Connection) -> io::Result<Option<Reservation>> {
         let row = db.query_row(
@@ -164,7 +172,7 @@ impl InstallationCatalog {
     }
     /// Local catalog state. Opening an active game verifies its independent pin again.
     pub fn active_pin(&self) -> io::Result<Option<[u8; 32]>> {
-        if database_version(&self.db)? == 3 {
+        if cancellation::has_learner(&self.db)? {
             return self.verified_learner_pin();
         }
         Ok(Self::reservation(&self.db)?.and_then(|r| r.pin))
@@ -180,7 +188,7 @@ impl InstallationCatalog {
         key: &SigningKey,
         lobby: Option<(CreateLobby<'_>, LobbyFormat)>,
     ) -> io::Result<Reservation> {
-        if database_version(&self.db)? == 3 {
+        if cancellation::has_learner(&self.db)? {
             return Err(invalid("learner owns the participation slot"));
         }
         if actor.is_empty() || actor.len() > 64 || request[6] >> 4 != 4 || request[8] >> 6 != 2 {
@@ -202,7 +210,8 @@ impl InstallationCatalog {
             if lobby.is_some_and(|(input, _)| !input.profile_complete || !input.can_host) {
                 return Err(invalid("local profile or hosting eligibility unavailable"));
             }
-            ensure_empty_inventory(&self.directory)?;
+            check_new_inventory(&tx, &self.directory)?;
+            cancellation::reject_closed_create(&tx, actor, &request)?;
             tx.execute("INSERT INTO participation(slot,request,session,actor,public_key,node) VALUES(1,?,randomblob(16),?,?,randomblob(16))",
             params![request,actor,key.verifying_key().as_bytes()]).map_err(io::Error::other)?;
             let mut r = Self::reservation(&tx)?.ok_or(invalid("missing reservation"))?;
@@ -276,7 +285,7 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
-        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::DreamReady)
+        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::Cancellable)
             .await
     }
 

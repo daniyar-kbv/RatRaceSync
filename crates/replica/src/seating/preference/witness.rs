@@ -253,13 +253,14 @@ impl GameNode {
             .await
             .map_err(io::Error::other)?;
         let r = &self.replica;
-        if r.lobby_format != Some(lobby::LobbyFormat::DreamReady) {
+        if r.lobby_format.is_none_or(|f| !f.preferences()) {
             return Err(invalid("unsupported preference profile"));
         }
         let db = r.lock()?;
         r.require_lobby_genesis(&db)?;
         r.verify_replay(&db)?;
         lobby(&db)?;
+        cancellation::require_open(&db, u64::MAX)?;
         if read.0.len() > 512 {
             return Err(invalid("oversize private read"));
         }

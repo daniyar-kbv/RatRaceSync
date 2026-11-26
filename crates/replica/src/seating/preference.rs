@@ -105,6 +105,10 @@ fn history(db: &Connection, actor: &[u8], index: u64) -> io::Result<History> {
         ack,
     })
 }
+pub(super) fn acknowledgment(db: &Connection, actor: &[u8]) -> io::Result<(bool, Option<u64>)> {
+    let h = history(db, actor, u64::MAX)?;
+    Ok((h.ready, h.ack))
+}
 pub(super) fn effective(
     db: &Connection,
     actor: &[u8],

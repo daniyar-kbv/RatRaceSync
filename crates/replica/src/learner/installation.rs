@@ -41,6 +41,54 @@ fn read(db: &Connection) -> io::Result<Reservation> {
         verified: verified.map(|k| store::decode(&k)).transpose()?,
     })
 }
+pub(crate) fn create_learner_table(db: &Connection) -> io::Result<()> {
+    db.execute_batch("CREATE TABLE learner(slot INTEGER PRIMARY KEY CHECK(slot=1),session BLOB NOT NULL, invitation BLOB NOT NULL,
+                node BLOB UNIQUE NOT NULL CHECK(length(node)=16),actor BLOB NOT NULL,key BLOB NOT NULL CHECK(length(key)=32),
+                prepared INTEGER NOT NULL DEFAULT 0 CHECK(prepared IN(0,1)), verified BLOB) STRICT").map_err(io::Error::other)
+}
+
+pub(crate) fn cancellation_generation(
+    db: &Connection,
+) -> io::Result<Option<catalog::cancellation::CancellationGeneration>> {
+    let s = read(db)?;
+    let (creator, proof, format) = invitation(&s.session, &s.invitation)?;
+    Ok(
+        (s.prepared && format == lobby::LobbyFormat::Cancellable).then_some(
+            catalog::cancellation::CancellationGeneration {
+                session: s.session,
+                creator,
+                node: s.id,
+                pin: proof.fingerprint,
+            },
+        ),
+    )
+}
+pub(crate) fn check_cancellation_binding(
+    catalog: &Connection,
+    r: &Replica,
+    game: &Connection,
+    root: &[u8; 32],
+) -> io::Result<()> {
+    let s = read(catalog)?;
+    let (creator, proof, format) = invitation(&s.session, &s.invitation)?;
+    if !s.prepared
+        || format != lobby::LobbyFormat::Cancellable
+        || s.session != r.session
+        || Some(s.id) != r.local_node
+        || proof.fingerprint != *root
+    {
+        return Err(invalid(
+            "terminal decision differs from learner reservation",
+        ));
+    }
+    let binding = store::meta::<Vec<u8>>(game, "local_learner_admission")?
+        .ok_or(invalid("missing learner identity"))?;
+    let f = admission_fields(r, &binding, &creator)?;
+    if f[&4] != s.actor || f[&5] != s.key || f[&6] != s.id.0 {
+        return Err(invalid("learner identity mismatch"));
+    }
+    Ok(())
+}
 pub(crate) fn check_inventory(db: &Connection) -> io::Result<()> {
     let state = read(db)?;
     let (creator, _, _) = invitation(&state.session, &state.invitation)?;
@@ -225,7 +273,20 @@ impl InstallationCatalog {
             return Err(invalid("distinct learner identity required"));
         }
         let tx = self.db.transaction().map_err(io::Error::other)?;
-        if database_version(&tx)? == 2 {
+        let version = database_version(&tx)?;
+        if version == 4 {
+            let closed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM closed_game WHERE session=?)",
+                    [session],
+                    |row| row.get(0),
+                )
+                .map_err(io::Error::other)?;
+            if closed {
+                return Err(invalid("session is closed on this installation"));
+            }
+        }
+        if version == 2 || (version == 4 && !catalog::has_active_learner(&tx)?) {
             let occupied: bool = tx
                 .query_row("SELECT EXISTS(SELECT 1 FROM participation)", [], |r| {
                     r.get(0)
@@ -234,11 +295,12 @@ impl InstallationCatalog {
             if occupied {
                 return Err(invalid("another game owns the participation slot"));
             }
-            catalog::ensure_empty_inventory(&self.directory)?;
-            tx.execute_batch("CREATE TABLE learner(slot INTEGER PRIMARY KEY CHECK(slot=1),session BLOB NOT NULL, invitation BLOB NOT NULL,
-                node BLOB UNIQUE NOT NULL CHECK(length(node)=16),actor BLOB NOT NULL,key BLOB NOT NULL CHECK(length(key)=32),
-                prepared INTEGER NOT NULL DEFAULT 0 CHECK(prepared IN(0,1)), verified BLOB) STRICT;
-                PRAGMA user_version=3").map_err(io::Error::other)?;
+            catalog::check_new_inventory(&tx, &self.directory)?;
+            if version == 2 {
+                create_learner_table(&tx)?;
+                tx.pragma_update(None, "user_version", 3)
+                    .map_err(io::Error::other)?;
+            }
             tx.execute(
                 "INSERT INTO learner(slot,session,invitation,node,actor,key) VALUES(1,?,?,?,?,?)",
                 params![

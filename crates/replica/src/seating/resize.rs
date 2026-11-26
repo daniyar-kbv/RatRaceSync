@@ -60,7 +60,7 @@ impl Resize {
         let mut retained_facts = Vec::new();
         for (id, owner) in &self.occupied {
             let ready = [u8::from(
-                r.lobby_format == Some(lobby::LobbyFormat::DreamReady)
+                r.lobby_format.is_some_and(lobby::LobbyFormat::preferences)
                     && preference::effective(db, owner, index)?.ready,
             )];
             wire::field(
@@ -110,6 +110,7 @@ pub(crate) struct OpenLayout {
 }
 
 pub(crate) fn layout_at(db: &Connection, index: u64) -> io::Result<OpenLayout> {
+    cancellation::require_open(db, index)?;
     let created = lobby(db)?;
     let mut layout_revision = created.layout_revision;
     let mut order = created
