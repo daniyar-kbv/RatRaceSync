@@ -112,7 +112,11 @@ impl CancellationGeneration {
 fn cancellable_format(path: &Path) -> io::Result<LobbyFormat> {
     let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(io::Error::other)?;
-    match database_version(&db)? {
+    archived_format(&db)
+}
+pub(super) fn archived_format(db: &Connection) -> io::Result<LobbyFormat> {
+    match database_version(db)? {
+        11 => Ok(LobbyFormat::LastGuest),
         9 => Ok(LobbyFormat::Cancellable),
         10 => Ok(LobbyFormat::Departure),
         _ => Err(invalid("unsupported archived lobby")),

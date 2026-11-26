@@ -33,10 +33,10 @@ pub(super) fn commit(
     let seats = Snapshot::at(r.seat_changes(), db, &state, u64::MAX)?.view();
     let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
     let mut members = vec![(1, creator.actor, creator.node)];
-    let departed = departure::left_at(db, k.index)?;
+    let departed = departure::departures_at(db, k.index)?;
     for name in ["first_member", "third_member"] {
         if let Some(m) = store::meta::<JoinedMember>(db, name)?
-            && departed.as_ref().is_none_or(|left| left.node != m.node)
+            && !departed.iter().any(|left| left.node == m.node)
         {
             members.push((m.ordinal, m.actor, m.node));
         }

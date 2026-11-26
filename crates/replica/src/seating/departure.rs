@@ -1,5 +1,5 @@
-//! One direct three-to-two transition. Both successor voters retain the old
-//! prefix before authorizing a proposal. Only committed application creates the receipt.
+//! Direct lobby departures retain the predecessor quorum's certified history.
+//! Only the committed membership entry creates the receipt.
 use super::*;
 use openraft::{
     alias::StoredMembershipOf, entry::RaftPayload, raft::Precondition, type_config::TypeConfigExt,
@@ -28,46 +28,81 @@ pub(crate) fn reject_departed(
     peer: Option<ReplicaId>,
 ) -> io::Result<()> {
     if locally_retired(db)?
-        || left_at(db, u64::MAX)?.is_some_and(|d| d.node == local || Some(d.node) == peer)
+        || departures_at(db, u64::MAX)?
+            .iter()
+            .any(|d| d.node == local || Some(d.node) == peer)
     {
         return Err(invalid("departed voter"));
     }
     Ok(())
 }
 
-pub(crate) fn left_at(db: &Connection, index: u64) -> io::Result<Option<Departure>> {
-    Ok(store::meta::<Departure>(db, "departed_member")?.filter(|d| d.log_id.index <= index))
+pub(crate) fn last_guest_at(db: &Connection, index: u64) -> io::Result<Option<Departure>> {
+    Ok(store::meta::<Departure>(db, "last_guest_departure")?.filter(|d| d.log_id.index <= index))
 }
-pub(super) fn successors(db: &Connection, actor: &[u8], index: u64) -> io::Result<[Creator; 2]> {
-    let host = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-    if actor == host.actor || left_at(db, index)?.is_some() {
-        return Err(invalid(
-            "Leave requires an active guest in a three-player lobby",
-        ));
+
+pub(crate) fn departures_at(db: &Connection, index: u64) -> io::Result<Vec<Departure>> {
+    let mut departures = Vec::new();
+    for name in ["departed_member", "last_guest_departure"] {
+        if let Some(d) = store::meta::<Departure>(db, name)?.filter(|d| d.log_id.index <= index) {
+            departures.push(d);
+        }
     }
-    let joined = |name| -> io::Result<Creator> {
-        let m = store::meta::<JoinedMember>(db, name)?
-            .filter(|m| m.log_id.index <= index)
-            .ok_or(invalid("three joined voters required"))?;
-        Ok(Creator {
-            actor: m.actor,
-            key: m.key,
-            node: m.node,
-        })
-    };
-    let first = joined("first_member")?;
-    let third = joined("third_member")?;
-    let other = if first.actor == actor {
-        third
-    } else if third.actor == actor {
-        first
-    } else {
-        return Err(invalid("unknown departing member"));
-    };
-    Ok([host, other])
+    Ok(departures)
 }
-fn target(s: &[Creator; 2]) -> Members {
-    Members::new_with_defaults(vec![[s[0].node, s[1].node].into()], [])
+
+pub(crate) fn left_at(db: &Connection, index: u64) -> io::Result<Option<Departure>> {
+    Ok(departures_at(db, index)?.pop())
+}
+pub(super) fn successors(db: &Connection, actor: &[u8], index: u64) -> io::Result<Vec<Creator>> {
+    let host = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
+    if actor == host.actor {
+        return Err(invalid("creator cannot use guest Leave"));
+    }
+    let mut survivors = vec![host];
+    let mut joined = false;
+    let departed = departures_at(db, index)?;
+    for name in ["first_member", "third_member"] {
+        if let Some(m) = store::meta::<JoinedMember>(db, name)?
+            && m.log_id.index <= index
+            && !departed.iter().any(|d| d.node == m.node)
+        {
+            if m.actor == actor {
+                joined = true;
+            } else {
+                survivors.push(Creator {
+                    node: m.node,
+                    actor: m.actor,
+                    key: m.key,
+                });
+            }
+        }
+    }
+    if !joined {
+        return Err(invalid("Leave requires a joined guest"));
+    }
+    Ok(survivors)
+}
+
+fn authorizers(
+    db: &Connection,
+    guard: &SeatCommandGuard,
+    index: u64,
+    survivors: &[Creator],
+) -> io::Result<[Creator; 2]> {
+    let other = match survivors {
+        [_, guest] => guest.clone(),
+        [_] => {
+            let (node, key) = member(db, &guard.actor, index)?;
+            Creator {
+                node,
+                actor: guard.actor.clone(),
+                key,
+            }
+        }
+        _ => return Err(invalid("unsupported Leave membership")),
+    };
+    Ok([survivors[0].clone(), other])
 }
 fn command(r: &Replica, db: &Connection, raw: &[u8]) -> io::Result<SeatCommand> {
     let cmd = SeatCommand::verify(r, db, raw)?;
@@ -117,16 +152,38 @@ fn verify_proposal(
     let survivors = successors(db, &cmd.guard.actor, high.index)?;
     let previous = store::meta::<StoredMembershipOf<Types>>(db, "membership")?
         .ok_or(invalid("missing predecessor membership"))?;
+    // A registered learner has no vote. Preserve its replication role across
+    // the change without counting it as an approver or historical signer.
+    let learners: Vec<_> = previous.membership().non_write_voter_ids().collect();
     let old = Members::new_with_defaults(
-        vec![[survivors[0].node, survivors[1].node, cmd.guard.node].into()],
-        [],
+        vec![
+            survivors
+                .iter()
+                .map(|s| s.node)
+                .chain([cmd.guard.node])
+                .collect(),
+        ],
+        learners.iter().copied(),
     );
     if previous.membership() != &old {
         return Err(invalid("unexpected predecessor voter set"));
     }
     let body = support(r, db, high, f[&2])?;
-    for (who, packet) in survivors.iter().zip([f[&3], f[&4]]) {
-        let proof = fields(packet, &[1, 2])?;
+    let prior = confirmation::prior_body(r, db, high.index)?;
+    for (who, packet) in authorizers(db, &cmd.guard, high.index, &survivors)?
+        .iter()
+        .zip([f[&3], f[&4]])
+    {
+        let proof = fields(packet, if prior.is_some() { &[1, 2, 3] } else { &[1, 2] })?;
+        if let Some((_, prior_body)) = &prior {
+            VerifyingKey::from_bytes(&who.key)
+                .map_err(io::Error::other)?
+                .verify_strict(
+                    prior_body,
+                    &Signature::from_slice(proof[&3]).map_err(io::Error::other)?,
+                )
+                .map_err(io::Error::other)?;
+        }
         if proof[&1] != body {
             return Err(invalid("stale successor history acknowledgment"));
         }
@@ -138,7 +195,10 @@ fn verify_proposal(
             )
             .map_err(io::Error::other)?;
     }
-    Ok(target(&survivors))
+    Ok(Members::new_with_defaults(
+        vec![survivors.iter().map(|v| v.node).collect()],
+        learners,
+    ))
 }
 pub(crate) fn verify_entry<'a>(
     r: &Replica,
@@ -165,7 +225,10 @@ pub(crate) fn check_retained(
 ) -> io::Result<()> {
     r.require_lobby_genesis(db)?;
     r.verify_replay(db)?;
-    if let Some(d) = left_at(db, u64::MAX)? {
+    if let Some(d) = departures_at(db, u64::MAX)?
+        .iter()
+        .find(|d| d.log_id.index == e.log_id.index)
+    {
         let bytes: Vec<u8> = db
             .query_row(
                 "SELECT source FROM archive WHERE log_id=?",
@@ -218,7 +281,7 @@ fn outcome_at(
     let mut acknowledgment_facts = Vec::new();
     // Read the pre-entry history, including acknowledgments of the remaining voters.
     let others = successors(db, &g.actor, index)?;
-    for actor in [&g.actor, &others[0].actor, &others[1].actor] {
+    for actor in std::iter::once(&g.actor).chain(others.iter().map(|other| &other.actor)) {
         let h = preference::history(db, actor, index)?;
         if actor == &g.actor || h.ack.is_some() {
             let ack = h.ack.map(u64::to_be_bytes);
@@ -307,7 +370,11 @@ pub(super) fn commit(
     r.advance_setup(db, k.index, outcome.setup)?;
     store::put(
         db,
-        "departed_member",
+        if successors(db, &g.actor, k.index - 1)?.len() == 1 {
+            "last_guest_departure"
+        } else {
+            "departed_member"
+        },
         &Departure {
             node: g.node,
             actor: g.actor.clone(),
@@ -351,20 +418,34 @@ impl GameNode {
             return Err(invalid("successor history handoff incomplete"));
         }
         let db = r.lock()?;
+        reject_departed(
+            &db,
+            r.local_node.ok_or(invalid("missing local voter"))?,
+            None,
+        )?;
         let c = command(r, &db, &cmd.0)?;
         let voters = successors(&db, &c.guard.actor, high.index)?;
         if !matches!(c.current(r, &db)?, Some(Change::Leave))
-            || !voters
+            || !authorizers(&db, &c.guard, high.index, &voters)?
                 .iter()
                 .any(|v| Some(v.node) == r.local_node && v.key == key.verifying_key().to_bytes())
         {
             return Err(invalid("ineligible successor approval"));
         }
         let body = support(r, &db, high, &cmd.0)?;
-        Ok(message(&[(1, &body), (2, &key.sign(&body).to_bytes())]))
+        let signature = key.sign(&body).to_bytes();
+        if let Some((_, prior)) = confirmation::prior_body(r, &db, high.index)? {
+            return Ok(message(&[
+                (1, &body),
+                (2, &signature),
+                (3, &key.sign(&prior).to_bytes()),
+            ]));
+        }
+        Ok(message(&[(1, &body), (2, &signature)]))
     }
     /// The source-bearing membership entry is the only owner of the Leave receipt.
-    /// Approvals are supplied in creator, surviving guest order. A retry needs only the intent.
+    /// The creator signs first. The other signer is the surviving guest, or the departing
+    /// guest when the old quorum consists of two. A committed retry needs only the intent.
     pub async fn leave_lobby(&self, cmd: &Signed, approvals: [&[u8]; 2]) -> io::Result<Vec<u8>> {
         let permit = self.request_permit(cmd).await?;
         self.raft

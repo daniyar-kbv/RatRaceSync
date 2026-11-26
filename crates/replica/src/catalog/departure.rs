@@ -2,7 +2,8 @@ use super::*;
 use crate::seating::departure::confirmation::{Evidence, LOCAL};
 
 impl InstallationCatalog {
-    /// Release only the departing installation, using confirmations by both successor voters.
+    /// Release only the departing installation, using confirmations from every successor voter.
+    /// For a sole successor, supply its confirmation and an empty second slice.
     pub fn finish_lobby_leave(
         &mut self,
         learner: &Learner,
@@ -37,9 +38,10 @@ impl InstallationCatalog {
             .as_ref()
             .or(prior.as_ref())
             .ok_or(invalid("missing departure evidence"))?;
-        let receipt = evidence.verify(&game, &r.session, pin, id)?;
+        let format = r.lobby_format.ok_or(invalid("missing lobby profile"))?;
+        let receipt = evidence.verify(format, &game, &r.session, pin, id)?;
         if let Some(prior) = &prior
-            && prior.verify(&game, &r.session, pin, id)? != receipt
+            && prior.verify(format, &game, &r.session, pin, id)? != receipt
         {
             return Err(invalid("different confirmed departure"));
         }
@@ -125,16 +127,11 @@ impl InstallationCatalog {
         let mut db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(io::Error::other)?;
         let tx = db.transaction().map_err(io::Error::other)?;
-        genesis::verify_pinned_game(
-            &tx,
-            session,
-            LobbyFormat::Departure.profile(),
-            Some(id),
-            &pin,
-        )?;
+        let format = cancellation::archived_format(&tx)?;
+        genesis::verify_pinned_game(&tx, session, format.profile(), Some(id), &pin)?;
         let evidence =
             store::meta::<Evidence>(&tx, LOCAL)?.ok_or(invalid("missing local departure proof"))?;
-        if evidence.verify(&tx, session, &pin, id)? != receipt {
+        if evidence.verify(format, &tx, session, &pin, id)? != receipt {
             return Err(invalid("departure proof differs from catalog"));
         }
         Ok(Some(receipt))

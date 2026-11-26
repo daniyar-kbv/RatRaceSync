@@ -17,14 +17,16 @@ pub(crate) fn boundary(db: &Connection) -> io::Result<LogId> {
     }
     Ok(applied)
 }
-fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Vec<u8>>> {
+fn membership_entry(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Entry>> {
     let entry:Option<Vec<u8>>=db.query_row(
         "SELECT l.entry FROM archive a JOIN raft_log l USING(idx)
         WHERE (a.idx<?1 OR (?2 AND a.idx=?1)) AND substr(a.source,1,1) IN(x'02',x'03') ORDER BY a.idx DESC LIMIT 1",
         params![idx.to_be_bytes(),inclusive],|r|r.get(0)).optional().map_err(io::Error::other)?;
-    entry
-        .map(|bytes| {
-            let entry = store::decode::<Entry>(&bytes)?;
+    entry.map(|bytes| store::decode(&bytes)).transpose()
+}
+fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Vec<u8>>> {
+    membership_entry(db, idx, inclusive)?
+        .map(|entry| {
             let members = entry
                 .payload
                 .check_members()?
@@ -33,12 +35,17 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
             let valid = if let Some(d) = seating::departure::left_at(db, entry.log_id.index)? {
                 let voters = super::quorum::voters(db, entry.log_id.index)?;
+                let prior = membership_entry(db, entry.log_id.index, false)?
+                    .ok_or(invalid("missing Leave predecessor"))?
+                    .payload
+                    .check_members()?
+                    .ok_or(invalid("invalid Leave predecessor"))?;
                 entry.log_id == d.log_id
                     && entry.payload.leave_source()?.is_some()
                     && members
                         == Members::new_with_defaults(
                             vec![voters.iter().map(|v| v.node).collect()],
-                            [],
+                            prior.non_write_voter_ids(),
                         )
             } else if let Some(third) = third_at(db, entry.log_id.index)? {
                 let first = joined_at(db, entry.log_id.index)?
@@ -121,7 +128,7 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
         if let Some(third) = third_at(db, index)? {
             bindings.push((third.node, binding(&third.actor, &third.key, third.node)));
         }
-        if let Some(d) = seating::departure::left_at(db, index)? {
+        for d in seating::departure::departures_at(db, index)? {
             bindings.retain(|(id, _)| *id != d.node);
         }
         bindings.sort_by_key(|x| x.0);

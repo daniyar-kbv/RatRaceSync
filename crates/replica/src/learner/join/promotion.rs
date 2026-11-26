@@ -118,7 +118,9 @@ impl Replica {
                 leaving = true;
                 continue;
             }
-            if promoted
+            if leaving
+                || seating::departure::left_at(db, applied.index)?.is_some()
+                || promoted
                 || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?
                     != entry.log_id.index.to_be_bytes()
             {

@@ -82,6 +82,12 @@ impl RaftPayload for Source {
     }
 }
 impl Source {
+    pub(crate) fn retained_membership(bytes: Vec<u8>, members: Members) -> Self {
+        Self {
+            bytes,
+            members: Some(members),
+        }
+    }
     pub(crate) fn leave_source(&self) -> io::Result<Option<&[u8]>> {
         Ok(self
             .combined_command()?

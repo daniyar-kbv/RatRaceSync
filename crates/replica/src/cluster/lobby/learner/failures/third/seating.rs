@@ -3,6 +3,7 @@ mod cancellation;
 mod changes;
 mod departure;
 mod history;
+mod last_guest;
 mod readiness;
 mod resize;
 mod restart;

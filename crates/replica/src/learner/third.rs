@@ -36,7 +36,8 @@ fn member(db: &Connection) -> io::Result<JoinedMember> {
 
 fn require_open_place(db: &Connection) -> io::Result<()> {
     let lobby = seating::layout_at(db, u64::MAX)?;
-    if lobby.seats.capacity().count() <= 2
+    if seating::departure::left_at(db, u64::MAX)?.is_some()
+        || lobby.seats.capacity().count() <= 2
         || store::meta::<JoinedMember>(db, "third_member")?.is_some()
     {
         return Err(invalid("no open place for an additional player"));
@@ -199,15 +200,16 @@ impl GameNode {
         mut peer: impl AsyncFnMut(VotingHistoryRequest) -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
         let r = &self.replica;
-        let (join, high, promoted) = {
+        let (join, high, reconcile_range) = {
             let db = r.lock()?;
             (
                 member(&db)?.log_id,
                 history::boundary(&db)?,
-                store::meta::<JoinedMember>(&db, "third_member")?.is_some(),
+                store::meta::<JoinedMember>(&db, "third_member")?.is_some()
+                    || seating::departure::last_guest_at(&db, u64::MAX)?.is_some(),
             )
         };
-        if promoted {
+        if reconcile_range {
             return self.reconcile_voting_history(high, key, peer).await;
         }
         if !self.voting_history_complete(join)? {

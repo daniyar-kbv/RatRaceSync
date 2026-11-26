@@ -179,6 +179,7 @@ impl Replica {
             Some(lobby::LobbyFormat::DreamReady) => 8,
             Some(lobby::LobbyFormat::Cancellable) => 9,
             Some(lobby::LobbyFormat::Departure) => 10,
+            Some(lobby::LobbyFormat::LastGuest) => 11,
             Some(lobby::LobbyFormat::SeatChanges) => 6,
             Some(lobby::LobbyFormat::Seating) => 5,
             Some(lobby::LobbyFormat::Legacy) => 3,

@@ -71,6 +71,7 @@ pub(crate) fn invitation(
         lobby::LobbyFormat::DreamReady,
         lobby::LobbyFormat::Cancellable,
         lobby::LobbyFormat::Departure,
+        lobby::LobbyFormat::LastGuest,
     ]
     .into_iter()
     .find(|f| body[&11] == genesis::profile_manifest(f.profile()))
@@ -460,6 +461,9 @@ impl CreatorGame {
             if r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) {
                 r.verify_replay(&tx)?;
                 seating::cancellation::require_open(&tx, u64::MAX)?;
+            }
+            if store::meta::<JoinedMember>(&tx, "first_member")?.is_some() {
+                return Err(invalid("initial learner admission already completed"));
             }
             let f = admission_fields(r, admission, &creator)?;
             let id = ReplicaId(fixed(f[&6])?);

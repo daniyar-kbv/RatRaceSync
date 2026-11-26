@@ -77,7 +77,7 @@ async fn independently_verify_complete_lobby_records_at_the_original_checkpoint(
         assert_eq!(sha.finalize().as_slice(), expected);
         let outer = decode_frames(&record);
         let facts = decode_frames(outer[10]);
-        let profile = b"RatRaceSync/Classic101/lobby/v8";
+        let profile = b"RatRaceSync/Classic101/lobby/v9";
         assert_eq!(outer[1], profile);
         assert_eq!(outer[2], game.session);
         if ledger == "event" {

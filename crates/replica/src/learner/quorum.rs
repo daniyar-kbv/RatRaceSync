@@ -76,6 +76,28 @@ impl GameNode {
         key: &SigningKey,
         mut exchange: impl AsyncFnMut(VotingHistoryRequest) -> io::Result<Vec<u8>>,
     ) -> io::Result<()> {
+        let last_guest = seating::departure::last_guest_at(&*self.replica.lock()?, k.index)?;
+        if let Some(departure) = last_guest {
+            // Verify the requested full LogId before writing any part of its range.
+            {
+                let db = self.replica.lock()?;
+                let voters = committed(&self.replica, &db, k)?;
+                if voters.len() != 1 {
+                    return Err(invalid("expected sole successor voter"));
+                }
+                signer(&self.replica, &db, &voters, key)?;
+            }
+            for i in departure.log_id.index..=k.index {
+                let checkpoint = bundles::log_id(&*self.replica.lock()?, i)?;
+                if self.voting_history_complete(checkpoint)? {
+                    continue;
+                }
+                let signature = self.sign_voting_checkpoint(checkpoint, key)?;
+                let ack = self.store_voting_checkpoint(checkpoint, &signature, &[], key)?;
+                self.confirm_voting_checkpoint(checkpoint, &ack, &[])?;
+            }
+            return Ok(());
+        }
         let third = history::third_at(&*self.replica.lock()?, k.index)?;
         if let Some(m) = third {
             return self.reconcile_bundle(m.log_id, k, key, exchange).await;
@@ -120,7 +142,7 @@ pub(super) fn voters(db: &Connection, index: u64) -> io::Result<Vec<Creator>> {
             node: m.node,
         });
     }
-    if let Some(d) = seating::departure::left_at(db, index)? {
+    for d in seating::departure::departures_at(db, index)? {
         voters.retain(|v| v.node != d.node);
     }
     voters.sort_by_key(|v| v.node);
@@ -161,12 +183,18 @@ fn signer<'a>(
         .find(|v| r.local_node == Some(v.node) && &v.key == key.verifying_key().as_bytes())
         .ok_or(invalid("ineligible local voter signer"))
 }
-fn pair(
+fn quorum_record(
     left: &[u8],
     right: &[u8],
     voters: &[Creator],
     body: impl Fn(&Creator) -> io::Result<Vec<u8>>,
 ) -> io::Result<Vec<u8>> {
+    if let [sole] = voters {
+        if !right.is_empty() || authenticate(left, &sole.key)? != body(sole)? {
+            return Err(invalid("invalid sole-voter record"));
+        }
+        return Ok(message(&[(1, left)]));
+    }
     let mut signed = Vec::with_capacity(2);
     for packet in [left, right] {
         let (v, actual) = voters
@@ -191,7 +219,7 @@ fn certificate(
     a: &[u8],
     b: &[u8],
 ) -> io::Result<Vec<u8>> {
-    pair(a, b, &voters(db, index)?, |v| {
+    quorum_record(a, b, &voters(db, index)?, |v| {
         history::signer_record(r, db, index, v)
     })
 }
@@ -201,8 +229,8 @@ pub(super) fn verify_certificate(
     index: u64,
     cert: &[u8],
 ) -> io::Result<()> {
-    let f = fields(cert, &[1, 2])?;
-    if certificate(r, db, index, f[&1], f[&2])? != cert {
+    let (a, b) = signatures(cert, &voters(db, index)?)?;
+    if certificate(r, db, index, a, b)? != cert {
         return Err(invalid("noncanonical certificate set"));
     }
     Ok(())
@@ -283,7 +311,7 @@ impl GameNode {
         let tx = db.transaction().map_err(io::Error::other)?;
         let voters = committed(r, &tx, k)?;
         let digest = bundles::ack_digest(r, &tx, k, a, &voters)?;
-        let record = pair(a, b, &voters, |v| Ok(storage_ack(r, k, &digest, v)))?;
+        let record = quorum_record(a, b, &voters, |v| Ok(storage_ack(r, k, &digest, v)))?;
         let slot = format!("handoff_{}", k.index);
         if let Some(original) = store::meta::<Vec<u8>>(&tx, &slot)? {
             verify_handoff(r, &tx, k, &original, &voters)?;
@@ -314,6 +342,13 @@ impl GameNode {
         Ok(true)
     }
 }
+fn signatures<'a>(record: &'a [u8], voters: &[Creator]) -> io::Result<(&'a [u8], &'a [u8])> {
+    if voters.len() == 1 {
+        return Ok((fields(record, &[1])?[&1], &[]));
+    }
+    let f = fields(record, &[1, 2])?;
+    Ok((f[&1], f[&2]))
+}
 fn verify_handoff(
     r: &Replica,
     db: &Connection,
@@ -321,9 +356,9 @@ fn verify_handoff(
     record: &[u8],
     voters: &[Creator],
 ) -> io::Result<()> {
-    let f = fields(record, &[1, 2])?;
-    let digest = bundles::ack_digest(r, db, k, f[&1], voters)?;
-    if pair(f[&1], f[&2], voters, |v| Ok(storage_ack(r, k, &digest, v)))? != record {
+    let (a, b) = signatures(record, voters)?;
+    let digest = bundles::ack_digest(r, db, k, a, voters)?;
+    if quorum_record(a, b, voters, |v| Ok(storage_ack(r, k, &digest, v)))? != record {
         return Err(invalid("invalid durable handoff"));
     }
     Ok(())

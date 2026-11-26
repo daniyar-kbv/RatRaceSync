@@ -15,7 +15,7 @@ fn link(previous: &[u8; 32], k: LogId, cert: &[u8]) -> [u8; 32] {
 fn slot(digest: &[u8; 32]) -> String {
     format!("certificate_range_{}", hex(digest))
 }
-fn log_id(db: &Connection, i: u64) -> io::Result<LogId> {
+pub(super) fn log_id(db: &Connection, i: u64) -> io::Result<LogId> {
     let raw: Vec<u8> = db
         .query_row(
             "SELECT entry FROM raft_log WHERE idx=?",

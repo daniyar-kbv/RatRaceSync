@@ -219,7 +219,9 @@ fn member(db: &Connection, actor: &[u8], index: u64) -> io::Result<(ReplicaId, [
         if let Some(joined) = store::meta::<JoinedMember>(db, name)?
             && joined.actor == actor
             && joined.log_id.index <= index
-            && !departure::left_at(db, index)?.is_some_and(|left| left.node == joined.node)
+            && !departure::departures_at(db, index)?
+                .iter()
+                .any(|left| left.node == joined.node)
         {
             return Ok((joined.node, joined.key));
         }
@@ -255,7 +257,14 @@ enum Change {
 impl TableAction {
     fn guard_tags(self, format: lobby::LobbyFormat) -> io::Result<&'static [u32]> {
         match self {
-            Self::Leave if format == lobby::LobbyFormat::Departure => Ok(&[1, 2, 3, 4, 5, 6]),
+            Self::Leave
+                if matches!(
+                    format,
+                    lobby::LobbyFormat::Departure | lobby::LobbyFormat::LastGuest
+                ) =>
+            {
+                Ok(&[1, 2, 3, 4, 5, 6])
+            }
             Self::Cancel if format.cancellable() => Ok(&[1, 2, 3, 4, 5, 6]),
             Self::Preference(_) if format.preferences() => Ok(&[1, 2, 3, 4, 5, 6, 7]),
             Self::Resize(_) if format.resizable() => Ok(&[1, 2, 3, 4, 5]),
@@ -267,17 +276,17 @@ impl TableAction {
 
     fn evaluate(
         self,
-        has_seat_history: bool,
+        format: lobby::LobbyFormat,
         db: &Connection,
         state: &OpenLayout,
         actor: &[u8],
         index: u64,
     ) -> io::Result<(Change, Dependencies)> {
-        let table = Snapshot::at(has_seat_history, db, state, index)?;
+        let table = Snapshot::at(format.seat_history(), db, state, index)?;
         match self {
             Self::Occupancy(action) => {
                 let tr = table.transition(actor, action)?;
-                let material = if has_seat_history {
+                let material = if format.seat_history() {
                     Dependencies::Occupancy(Material::at(db, &table, actor, index, tr)?)
                 } else {
                     Dependencies::Legacy
@@ -288,7 +297,10 @@ impl TableAction {
             Self::Leave | Self::Cancel => {
                 let leaving = matches!(self, Self::Leave);
                 if leaving {
-                    departure::successors(db, actor, index)?;
+                    let survivors = departure::successors(db, actor, index)?;
+                    if survivors.len() == 1 && format != lobby::LobbyFormat::LastGuest {
+                        return Err(invalid("single successor outside pinned profile"));
+                    }
                 } else if actor != state.host {
                     return Err(invalid("only the creator can cancel the lobby"));
                 }
@@ -459,7 +471,7 @@ impl SeatCommand {
         if layout != state.layout_revision {
             return Err(invalid("invalid observed layout revision"));
         }
-        let (_, material) = action.evaluate(format.seat_history(), db, &state, body[&3], index)?;
+        let (_, material) = action.evaluate(format, db, &state, body[&3], index)?;
         let mut expected = SeatCommandGuard {
             profile: format.profile().into(),
             session: session.into(),
@@ -492,7 +504,9 @@ impl SeatCommand {
     fn current(&self, r: &Replica, db: &Connection) -> io::Result<Option<Change>> {
         let g = &self.guard;
         if cancellation::at(db, u64::MAX)?.is_some()
-            || departure::left_at(db, u64::MAX)?.is_some_and(|m| m.actor == g.actor)
+            || departure::departures_at(db, u64::MAX)?
+                .iter()
+                .any(|m| m.actor == g.actor)
         {
             return Ok(None);
         }
@@ -500,15 +514,17 @@ impl SeatCommand {
         if state.layout_revision != g.layout {
             return Ok(None);
         }
-        let (change, material) =
-            match g
-                .action
-                .evaluate(r.seat_changes(), db, &state, &g.actor, u64::MAX)
-            {
-                Ok(pair) => pair,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-                Err(e) => return Err(e),
-            };
+        let (change, material) = match g.action.evaluate(
+            r.lobby_format.ok_or(invalid("missing lobby profile"))?,
+            db,
+            &state,
+            &g.actor,
+            u64::MAX,
+        ) {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(e) => return Err(e),
+        };
         Ok((material == g.material).then_some(change))
     }
     fn committed_receipt(&self, db: &Connection) -> io::Result<Option<Vec<u8>>> {
@@ -686,8 +702,9 @@ impl GameNode {
         let db = r.lock()?;
         r.require_lobby_genesis(&db)?;
         r.verify_replay(&db)?;
-        let index = departure::left_at(&db, u64::MAX)?
-            .filter(|d| d.actor == actor)
+        let index = departure::departures_at(&db, u64::MAX)?
+            .into_iter()
+            .find(|d| d.actor == actor)
             .map_or(u64::MAX, |d| d.log_id.index - 1);
         let (node, public) = member(&db, actor, index)?;
         if r.local_node != Some(node) || public != key.verifying_key().to_bytes() {
@@ -793,7 +810,13 @@ impl GameNode {
         let (node, _) = member(&db, actor, k.index)?;
         action.guard_tags(r.lobby_format.ok_or(invalid("missing lobby profile"))?)?;
         let state = layout_at(&db, k.index)?;
-        let (_, material) = action.evaluate(r.seat_changes(), &db, &state, actor, k.index)?;
+        let (_, material) = action.evaluate(
+            r.lobby_format.ok_or(invalid("missing lobby profile"))?,
+            &db,
+            &state,
+            actor,
+            k.index,
+        )?;
         Ok(SeatCommandGuard {
             profile: r.profile().into(),
             session: r.session.clone(),
