@@ -385,7 +385,15 @@ pub(super) fn verify_prefix(
     key: &[u8; 32],
     high: LogId,
 ) -> io::Result<()> {
-    for i in 0..=high.index {
+    verify_seals(r, db, key, 0..=high.index)
+}
+pub(super) fn verify_seals(
+    r: &Replica,
+    db: &Connection,
+    key: &[u8; 32],
+    indices: impl Iterator<Item = u64>,
+) -> io::Result<()> {
+    for i in indices {
         let cert = get(db, i)?.ok_or(invalid("historical certificate gap"))?;
         verify_seal(r, db, key, i, &cert)?;
     }

@@ -521,6 +521,34 @@ async fn last_guest_registered_learner_resumes_from_creator_alone() {
         .voter_recovery_chunk(&retry, &key(), async |_| panic!("unexpected peer"))
         .await
         .unwrap();
+    let other = root.path().join("other-installation");
+    std::fs::create_dir(&other).unwrap();
+    catalog
+        .db
+        .execute(
+            "VACUUM INTO ?",
+            [other.join("installation.sqlite").to_str().unwrap()],
+        )
+        .unwrap();
+    learner
+        .node
+        .replica
+        .lock()
+        .unwrap()
+        .execute(
+            "VACUUM INTO ?",
+            [other
+                .join(format!("learner-{id}-g1.sqlite"))
+                .to_str()
+                .unwrap()],
+        )
+        .unwrap();
+    let mut copied = InstallationCatalog::open(&other).unwrap();
+    assert!(
+        copied.accept_chunk(&mut learner, &final_reply).is_err(),
+        "another catalog activated this learner handle"
+    );
+    assert!(copied.active_pin().unwrap().is_none());
     let envelope = fields(&final_reply, &[1, 2]).unwrap();
     let retired = message(&[
         (1, envelope[&1]),
@@ -532,6 +560,36 @@ async fn last_guest_registered_learner_resumes_from_creator_alone() {
     r.p.bus.1.lock().unwrap().remove(&id);
     drop(learner);
     drop(catalog);
+    let file = path.join(format!("learner-{id}-g1.sqlite"));
+    let db = rusqlite::Connection::open(&file).unwrap();
+    let prior: Vec<u8> = db
+        .query_row(
+            "SELECT certificate FROM historic_seal WHERE idx=?",
+            [idx],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE historic_seal SET certificate=x'00' WHERE idx=?",
+        [idx],
+    )
+    .unwrap();
+    let mut partial = InstallationCatalog::open(&path).unwrap();
+    assert!(
+        partial
+            .resume_learner(&r.identity, Config::default(), r.p.bus.clone())
+            .await
+            .is_err(),
+        "restart trusted a damaged staged two-voter certificate"
+    );
+    assert!(partial.active_pin().unwrap().is_none());
+    db.execute(
+        "UPDATE historic_seal SET certificate=? WHERE idx=?",
+        rusqlite::params![prior, idx],
+    )
+    .unwrap();
+    drop(db);
+    drop(partial);
     r.p.shutdown().await;
     drop(r.p);
     let bus = Bus::default();

@@ -141,7 +141,17 @@ impl InstallationCatalog {
     pub(super) fn reserved_learner(&self, learner: &Learner) -> io::Result<Reservation> {
         let state = read(&self.db)?;
         let (_, pin, _) = invitation(&state.session, &state.invitation)?;
-        if !state.prepared
+        let path = self
+            .directory
+            .join(format!("learner-{}-g1.sqlite", state.id));
+        if learner
+            .node
+            .replica
+            .lock()?
+            .path()
+            .map(std::path::Path::new)
+            != Some(path.as_path())
+            || !state.prepared
             || state.actor != learner.actor
             || state.session != learner.node.replica.session
             || state.id != learner.id
@@ -368,7 +378,7 @@ impl InstallationCatalog {
             if !state.prepared {
                 history::schema(&tx)?;
             }
-            history::cursor(&tx)?;
+            let next = history::cursor(&tx)?;
             replica
                 .bound_root
                 .set(proof.fingerprint)
@@ -376,9 +386,16 @@ impl InstallationCatalog {
             if store::meta::<LogId>(&tx, "genesis_log")?.is_some() {
                 replica.require_lobby_genesis(&tx)?;
             }
-            if let Some(high) = state.verified {
+            let first_unverified = if let Some(high) = state.verified {
+                if high.index >= next {
+                    return Err(invalid("verified checkpoint exceeds durable cursor"));
+                }
                 validate_completion(&replica, &tx, &creator, &binding, high)?;
-            }
+                high.index + 1
+            } else {
+                0
+            };
+            history::verify_seals(&replica, &tx, &creator.key, first_unverified..next)?;
             tx.commit().map_err(io::Error::other)?;
         }
         if !state.prepared {
@@ -413,23 +430,18 @@ impl InstallationCatalog {
             .pending
             .as_ref()
             .ok_or(invalid("no outstanding challenge"))?;
-        let route = third::local_route(&learner.node.replica, &*learner.node.replica.lock()?)?;
-        let body = third::response_body(
-            &*learner.node.replica.lock()?,
-            response,
-            &learner.creator,
-            route.as_ref(),
-        )?;
+        self.reserved_learner(learner)?;
+        let r = &learner.node.replica;
+        let mut db = r.lock()?;
+        let tx = db.transaction().map_err(io::Error::other)?;
+        let route = third::local_route(r, &tx)?;
+        let body = third::response_body(&tx, response, &learner.creator, route.as_ref())?;
         let f = fields(body, &[1, 2, 3, 4, 5])?;
         if f[&1] != RESPONSE || f[&2] != Sha256::digest(pending).as_slice() {
             return Err(invalid("stale recovery response"));
         }
         let request = fields(pending, &[1, 2, 3, 4])?;
         let index = u64::from_be_bytes(fixed(request[&4])?);
-        self.reserved_learner(learner)?;
-        let r = &learner.node.replica;
-        let mut db = r.lock()?;
-        let tx = db.transaction().map_err(io::Error::other)?;
         r.require_lobby_genesis(&tx)?;
         let result = match f[&4] {
             [0] => {
