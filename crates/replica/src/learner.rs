@@ -201,7 +201,7 @@ impl LearnerReplication {
     pub async fn append_entries_with_join_source(
         &self,
         authenticated_sender: ReplicaId,
-        request: openraft::raft::AppendEntriesRequest<Types>,
+        mut request: openraft::raft::AppendEntriesRequest<Types>,
         source: Option<&[u8]>,
     ) -> io::Result<openraft::raft::AppendResult<Types>> {
         let route = { third::local_route(&self.replica, &*self.replica.lock()?)? };
@@ -236,8 +236,23 @@ impl LearnerReplication {
             }
         }
         let third = store::meta::<JoinedMember>(&*self.replica.lock()?, "third_member")?;
-        for entry in &request.entries {
+        let mut prefix_len = request.entries.len();
+        for (position, entry) in request.entries.iter().enumerate() {
             if let Some(packet) = entry.payload.leave_source()? {
+                // A reconnecting learner may receive the Leave and its dependencies
+                // together. Acknowledge only the prefix Raft actually accepted; retry
+                // the membership entry after its signed observation is locally applied.
+                if route.is_some()
+                    && !voters.contains(&self.local)
+                    && request
+                        .leader_commit
+                        .is_some_and(|k| k.index >= entry.log_id.index.saturating_sub(1))
+                    && store::meta::<LogId>(&*self.replica.lock()?, "applied")?
+                        .is_none_or(|k| k.index.saturating_add(1) < entry.log_id.index)
+                {
+                    prefix_len = position;
+                    break;
+                }
                 seating::departure::check_retained(
                     &self.replica,
                     &*self.replica.lock()?,
@@ -265,6 +280,17 @@ impl LearnerReplication {
             }
         }
         if let Some(route) = route {
+            if prefix_len < request.entries.len() {
+                request.entries.truncate(prefix_len);
+                let last = request
+                    .entries
+                    .last()
+                    .map(|e| e.log_id)
+                    .or(request.prev_log_id);
+                if last.map(|k| k.index) < request.leader_commit.map(|k| k.index) {
+                    request.leader_commit = last;
+                }
+            }
             route.check_replication(self.creator, authenticated_sender, &request)?;
             return self
                 .raft

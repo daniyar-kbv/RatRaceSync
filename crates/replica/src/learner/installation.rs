@@ -211,7 +211,12 @@ impl InstallationCatalog {
         loop {
             let response = exchange(learner.request(key)?).await?;
             let route = third::local_route(&learner.node.replica, &*learner.node.replica.lock()?)?;
-            let body = third::response_body(&response, &learner.creator, route.as_ref())?;
+            let body = third::response_body(
+                &*learner.node.replica.lock()?,
+                &response,
+                &learner.creator,
+                route.as_ref(),
+            )?;
             let f = fields(body, &[1, 2, 3, 4, 5])?;
             let pending = learner
                 .pending
@@ -409,7 +414,12 @@ impl InstallationCatalog {
             .as_ref()
             .ok_or(invalid("no outstanding challenge"))?;
         let route = third::local_route(&learner.node.replica, &*learner.node.replica.lock()?)?;
-        let body = third::response_body(response, &learner.creator, route.as_ref())?;
+        let body = third::response_body(
+            &*learner.node.replica.lock()?,
+            response,
+            &learner.creator,
+            route.as_ref(),
+        )?;
         let f = fields(body, &[1, 2, 3, 4, 5])?;
         if f[&1] != RESPONSE || f[&2] != Sha256::digest(pending).as_slice() {
             return Err(invalid("stale recovery response"));
@@ -522,7 +532,7 @@ fn validate_completion(
         route.verify_historical_join(r, db, route.join)?;
     }
     let fresh = fields(
-        third::response_body(&response, creator, route.as_ref())?,
+        third::response_body(db, &response, creator, route.as_ref())?,
         &[1, 2, 3, 4, 5],
     )?;
     let query = fields(&request, &[1, 2, 3, 4])?;

@@ -1,11 +1,48 @@
 use super::*;
 
+/// Recovery authority follows the configuration effective at the reported log index.
+fn sole_creator(
+    db: &Connection,
+    creator: &Creator,
+    route: &RecoveryRoute,
+    index: u64,
+) -> io::Result<bool> {
+    let entry = history::membership_entry(db, index, true)?
+        .ok_or(invalid("missing recovery membership"))?;
+    let members = entry
+        .payload
+        .check_members()?
+        .ok_or(invalid("missing recovery roster"))?;
+    if !members.non_write_voter_ids().eq([route.learner]) {
+        return Err(invalid("learner is not registered at checkpoint"));
+    }
+    if let Some(left) = seating::departure::last_guest_at(db, index)? {
+        if left.node == route.joined
+            && entry.log_id == left.log_id
+            && entry.payload.leave_source()?.is_some()
+            && members == Members::new_with_defaults(vec![[creator.node].into()], [route.learner])
+        {
+            return Ok(true);
+        }
+    } else if registration(&members, creator.node, route.joined) {
+        return Ok(false);
+    }
+    Err(invalid("unsupported learner recovery configuration"))
+}
+
+struct Report {
+    packet: Vec<u8>,
+    done: bool,
+    route: RecoveryRoute,
+    sole_creator: bool,
+}
+
 fn report(
     node: &GameNode,
     request: &[u8],
     key: &SigningKey,
     final_only: bool,
-) -> io::Result<(Vec<u8>, bool, RecoveryRoute)> {
+) -> io::Result<Report> {
     if request.len() > 65536 {
         return Err(invalid("oversized recovery challenge"));
     }
@@ -35,13 +72,8 @@ fn report(
     )?;
     r.require_lobby_genesis(&db)?;
     route.check_member(&db)?;
-    let m = history::membership(&db)?;
-    if !registration(m.membership(), creator.node, route.joined)
-        || !m.membership().non_write_voter_ids().eq([route.learner])
-    {
-        return Err(invalid("learner has no committed recovery admission"));
-    }
     let high = history::boundary(&db)?;
+    let sole_creator = sole_creator(&db, &creator, &route, high.index)?;
     let next = u64::from_be_bytes(fixed(query[&4])?);
     let end = high.index.checked_add(1).ok_or(invalid("log exhausted"))?;
     let done = next == end;
@@ -71,7 +103,12 @@ fn report(
     if reply.len() > LIMIT {
         return Err(invalid("recovery report too large"));
     }
-    Ok((reply, done, route))
+    Ok(Report {
+        packet: reply,
+        done,
+        route,
+        sole_creator,
+    })
 }
 fn quorum_body<'a>(
     packet: &'a [u8],
@@ -91,6 +128,7 @@ fn quorum_body<'a>(
     Ok(body)
 }
 pub(in crate::learner) fn response_body<'a>(
+    db: &Connection,
     packet: &'a [u8],
     creator: &Creator,
     route: Option<&RecoveryRoute>,
@@ -98,22 +136,39 @@ pub(in crate::learner) fn response_body<'a>(
     let Some(route) = route else {
         return authenticate(packet, &creator.key);
     };
-    // Each archive transfer needs a fresh donor signature. Completion needs
-    // two independently generated signatures for the very same challenge.
-    if let Ok(body) =
-        authenticate(packet, &creator.key).or_else(|_| authenticate(packet, &route.joined_key))
-    {
-        if fields(body, &[1, 2, 3, 4, 5])?[&4] == [0] {
-            return Ok(body);
+    // A piece carries its own historical certificate. Completion additionally
+    // requires fresh signatures from the quorum effective at that checkpoint.
+    let one = authenticate(packet, &creator.key);
+    let guest = || authenticate(packet, &route.joined_key);
+    let (body, creator_signed, pair) = if let Ok(body) = one {
+        (body, true, false)
+    } else if let Ok(body) = guest() {
+        (body, false, false)
+    } else {
+        (quorum_body(packet, creator, route)?, false, true)
+    };
+    let f = fields(body, &[1, 2, 3, 4, 5])?;
+    if f[&4] == [0] {
+        if !creator_signed && seating::departure::last_guest_at(db, u64::MAX)?.is_some() {
+            return Err(invalid("departed recovery donor"));
         }
-        return Err(invalid("one voter cannot confirm a two-voter checkpoint"));
+        return Ok(body);
     }
-    quorum_body(packet, creator, route)
+    let k = fixed::<32>(f[&3])?;
+    let sole = sole_creator(db, creator, route, u64::from_be_bytes(fixed(&k[24..])?))?;
+    if f[&4] != [1] || !(sole && creator_signed || !sole && pair) {
+        return Err(invalid("incorrect final recovery quorum"));
+    }
+    Ok(body)
 }
 impl GameNode {
     /// Verify the signed learner request and report this voter's own current checkpoint.
     pub fn attest_recovery(&self, request: &[u8], key: &SigningKey) -> io::Result<Vec<u8>> {
-        Ok(report(self, request, key, true)?.0)
+        let report = report(self, request, key, true)?;
+        if report.sole_creator {
+            return Err(invalid("singleton completion requires a quorum read"));
+        }
+        Ok(report.packet)
     }
     /// Serve an original archive piece, or obtain both fresh reports at completion.
     /// The final exchange is driven by the established leader after a quorum read.
@@ -123,16 +178,21 @@ impl GameNode {
         key: &SigningKey,
         peer: impl AsyncFnOnce(Vec<u8>) -> io::Result<Vec<u8>>,
     ) -> io::Result<Vec<u8>> {
-        let (local, done, _) = report(self, request, key, false)?;
-        if !done {
-            return Ok(local);
+        let initial = report(self, request, key, false)?;
+        if !initial.done {
+            return Ok(initial.packet);
         }
         self.raft
             .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
             .await
             .map_err(io::Error::other)?;
+        if initial.sole_creator {
+            return Ok(report(self, request, key, true)?.packet);
+        }
         let remote = peer(request.to_vec()).await?;
-        let (local, _, route) = report(self, request, key, true)?;
+        let final_report = report(self, request, key, true)?;
+        let route = final_report.route;
+        let local = final_report.packet;
         let creator = creator(&*self.replica.lock()?)?;
         let (a, b) = if self.replica.local_node == Some(creator.node) {
             (local, remote)

@@ -407,6 +407,200 @@ async fn last_guest_preserves_a_registered_nonvoting_learner() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_guest_registered_learner_resumes_from_creator_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let pair = finish_pair(Peers::with_profile(root.path(), 3, LobbyFormat::LastGuest).await).await;
+    let mut r = admit_to_pair(root.path(), pair).await;
+    let host = &r.p.game.node;
+    let guest = &r.p.learner;
+    let first = r.third.request(&r.identity).unwrap();
+    let piece = host
+        .voter_recovery_chunk(&first, &key(), async |_| panic!("piece contacted peer"))
+        .await
+        .unwrap();
+    r.catalog.accept_chunk(&mut r.third, &piece).unwrap();
+    let id = r.third.id();
+    r.p.bus.1.lock().unwrap().remove(&id);
+    r.third.shutdown().await.unwrap();
+    drop(r.third);
+    drop(r.catalog);
+    let (_, receipt) = last_guest(host, guest, &r.p.identity, &mut r.p.catalog, &r.p.bus).await;
+    r.p.bus.6.lock().unwrap().take();
+    let path = root.path().join("third");
+    let mut catalog = InstallationCatalog::open(&path).unwrap();
+    let mut learner = catalog
+        .resume_learner(&r.identity, Config::default(), r.p.bus.clone())
+        .await
+        .unwrap();
+    r.p.bus
+        .1
+        .lock()
+        .unwrap()
+        .insert(id, (r.p.game.creator_node, learner.replication()));
+    // Replace the two-voter Join certificate with a genuine creator-only signature.
+    // Even a freshly signed donor envelope cannot authorize that historical entry.
+    let join = r.join.log_id;
+    let solo = host.sign_voting_checkpoint(join, &key()).unwrap();
+    let mut injected = false;
+    let attempt = catalog
+        .recover_learner(&mut learner, &r.identity, async |request| {
+            let body = fields(fields(&request, &[1, 2])?[&1], &[1, 2, 3, 4])?;
+            let response = host
+                .voter_recovery_chunk(&request, &key(), async |_| panic!("retired peer"))
+                .await?;
+            if body[&4] != join.index.to_be_bytes() {
+                return Ok(response);
+            }
+            injected = true;
+            let mut record = response_fields(&response);
+            let data = fields(record[&5], &[1, 2])?;
+            let cert = message(&[(1, &solo)]);
+            let substituted = message(&[(1, &cert), (2, data[&2])]);
+            record.insert(5, &substituted);
+            let body = message(&record.into_iter().collect::<Vec<_>>());
+            Ok(message(&[(1, &body), (2, &key().sign(&body).to_bytes())]))
+        })
+        .await;
+    assert!(injected && attempt.is_err());
+    assert!(catalog.active_pin().unwrap().is_none());
+    let resume = learner.request(&r.identity).unwrap();
+    assert_eq!(
+        fields(fields(&resume, &[1, 2]).unwrap()[&1], &[1, 2, 3, 4]).unwrap()[&4],
+        join.index.to_be_bytes()
+    );
+    let idx = join.index.to_be_bytes();
+    let original: Vec<u8> = {
+        let db = host.replica.lock().unwrap();
+        let cert = db
+            .query_row(
+                "SELECT certificate FROM historic_seal WHERE idx=?",
+                [idx],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute("DELETE FROM historic_seal WHERE idx=?", [idx])
+            .unwrap();
+        cert
+    };
+    assert!(
+        host.voter_recovery_chunk(&resume, &key(), async |_| panic!("unexpected peer"))
+            .await
+            .is_err()
+    );
+    assert!(catalog.active_pin().unwrap().is_none());
+    host.replica
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO historic_seal VALUES(?,?)",
+            rusqlite::params![idx, original],
+        )
+        .unwrap();
+    let mut lost_final = false;
+    let attempt = catalog
+        .recover_learner(&mut learner, &r.identity, async |request| {
+            let response = host
+                .voter_recovery_chunk(&request, &key(), async |_| {
+                    panic!("retired voter contacted")
+                })
+                .await?;
+            if response_fields(&response)[&4] == [1] {
+                lost_final = true;
+                return Err(io::ErrorKind::ConnectionReset.into());
+            }
+            Ok(response)
+        })
+        .await;
+    assert!(
+        lost_final,
+        "did not reach verified final response: {attempt:?}"
+    );
+    assert!(catalog.active_pin().unwrap().is_none());
+    let retry = learner.request(&r.identity).unwrap();
+    let final_reply = host
+        .voter_recovery_chunk(&retry, &key(), async |_| panic!("unexpected peer"))
+        .await
+        .unwrap();
+    let envelope = fields(&final_reply, &[1, 2]).unwrap();
+    let retired = message(&[
+        (1, envelope[&1]),
+        (2, &r.p.identity.sign(envelope[&1]).to_bytes()),
+    ]);
+    assert!(catalog.accept_chunk(&mut learner, &retired).is_err());
+    assert!(catalog.active_pin().unwrap().is_none());
+    learner.shutdown().await.unwrap();
+    r.p.bus.1.lock().unwrap().remove(&id);
+    drop(learner);
+    drop(catalog);
+    r.p.shutdown().await;
+    drop(r.p);
+    let bus = Bus::default();
+    let mut creator = InstallationCatalog::open(&root.path().join("creator")).unwrap();
+    let game = creator
+        .open_active(Config::default(), bus.clone())
+        .await
+        .unwrap();
+    let host = &game.node;
+    host.raft
+        .wait(Some(Duration::from_secs(8)))
+        .state(openraft::ServerState::Leader, "sole creator restart")
+        .await
+        .unwrap();
+    host.raft
+        .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
+        .await
+        .unwrap();
+    host.certify_recovery_tail(&key(), async |_| panic!("retired guest"))
+        .await
+        .unwrap();
+    let mut catalog = InstallationCatalog::open(&path).unwrap();
+    let mut learner = catalog
+        .resume_learner(&r.identity, Config::default(), bus.clone())
+        .await
+        .unwrap();
+    bus.1
+        .lock()
+        .unwrap()
+        .insert(id, (game.creator_node, learner.replication()));
+    let lobby = catalog
+        .recover_learner(&mut learner, &r.identity, async |request| {
+            host.voter_recovery_chunk(&request, &key(), async |_| panic!("unexpected peer"))
+                .await
+        })
+        .await
+        .unwrap();
+    let again = catalog
+        .recover_learner(&mut learner, &r.identity, async |request| {
+            let reply = host
+                .voter_recovery_chunk(&request, &key(), async |_| panic!("unexpected peer"))
+                .await?;
+            assert_eq!(response_fields(&reply)[&4], [1]);
+            Ok(reply)
+        })
+        .await
+        .unwrap();
+    assert_eq!(lobby, again);
+    assert_eq!(catalog.recovered_lobby(&learner).unwrap(), Some(lobby));
+    assert!(learner.joined_node().is_err());
+    {
+        let db = learner.node.replica.lock().unwrap();
+        let roster = crate::learner::history::membership(&db).unwrap();
+        assert!(roster.membership().voter_ids().eq([game.creator_node]));
+        assert!(roster.membership().non_write_voter_ids().eq([id]));
+        let saved: Vec<u8> = db
+            .query_row(
+                "SELECT record FROM receipt ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, receipt);
+    }
+    learner.shutdown().await.unwrap();
+    host.raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn last_guest_cannot_sign_a_prepared_promotion_after_release() {
     let root = tempfile::tempdir().unwrap();
     let pair = finish_pair(Peers::with_profile(root.path(), 3, LobbyFormat::LastGuest).await).await;

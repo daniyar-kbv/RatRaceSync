@@ -17,7 +17,11 @@ pub(crate) fn boundary(db: &Connection) -> io::Result<LogId> {
     }
     Ok(applied)
 }
-fn membership_entry(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Entry>> {
+pub(super) fn membership_entry(
+    db: &Connection,
+    idx: u64,
+    inclusive: bool,
+) -> io::Result<Option<Entry>> {
     let entry:Option<Vec<u8>>=db.query_row(
         "SELECT l.entry FROM archive a JOIN raft_log l USING(idx)
         WHERE (a.idx<?1 OR (?2 AND a.idx=?1)) AND substr(a.source,1,1) IN(x'02',x'03') ORDER BY a.idx DESC LIMIT 1",
