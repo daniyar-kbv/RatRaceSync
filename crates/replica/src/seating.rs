@@ -667,6 +667,9 @@ impl GameNode {
             }
             return Ok(committed.unwrap_or(saved));
         }
+        if committed.is_none() {
+            departure::reject_departed(&tx, command.guard.node, None)?;
+        }
         let raw = committed.unwrap_or(raw);
         store::put(&tx, &name, &raw)?;
         tx.commit().map_err(io::Error::other)?;

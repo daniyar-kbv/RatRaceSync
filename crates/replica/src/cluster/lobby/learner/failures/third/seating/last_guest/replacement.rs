@@ -1,5 +1,7 @@
 use super::*;
 
+mod ready;
+
 struct CreatorTransport<'a> {
     host: &'a GameNode,
     learner: ReplicaId,
