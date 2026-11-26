@@ -18,13 +18,19 @@ fn sole_creator(
     }
     if let Some(left) = seating::departure::last_guest_at(db, index)? {
         if left.node == route.joined
-            && entry.log_id == left.log_id
-            && entry.payload.leave_source()?.is_some()
+            && ((route.departure.is_none()
+                && entry.log_id == left.log_id
+                && entry.payload.leave_source()?.is_some())
+                || (route.departure == Some(left.log_id)
+                    && entry
+                        .payload
+                        .registration_source()?
+                        .is_some_and(|raw| route.matches_registration(raw))))
             && members == Members::new_with_defaults(vec![[creator.node].into()], [route.learner])
         {
             return Ok(true);
         }
-    } else if registration(&members, creator.node, route.joined) {
+    } else if route.departure.is_none() && registration(&members, creator.node, route.joined) {
         return Ok(false);
     }
     Err(invalid("unsupported learner recovery configuration"))
@@ -57,11 +63,12 @@ fn report(
         return Err(invalid("invalid recovery challenge"));
     }
     let signer = key.verifying_key().to_bytes();
-    if ![
-        (Some(creator.node), creator.key),
-        (Some(route.joined), route.joined_key),
-    ]
-    .contains(&(r.local_node, signer))
+    if (route.departure.is_some() && r.local_node != Some(creator.node))
+        || ![
+            (Some(creator.node), creator.key),
+            (Some(route.joined), route.joined_key),
+        ]
+        .contains(&(r.local_node, signer))
     {
         return Err(invalid("not an eligible recovery donor"));
     }
@@ -149,7 +156,10 @@ pub(in crate::learner) fn response_body<'a>(
     };
     let f = fields(body, &[1, 2, 3, 4, 5])?;
     if f[&4] == [0] {
-        if !creator_signed && seating::departure::last_guest_at(db, u64::MAX)?.is_some() {
+        if !creator_signed
+            && (route.departure.is_some()
+                || seating::departure::last_guest_at(db, u64::MAX)?.is_some())
+        {
             return Err(invalid("departed recovery donor"));
         }
         return Ok(body);

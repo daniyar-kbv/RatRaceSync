@@ -153,6 +153,12 @@ impl LearnerReplication {
     ) -> io::Result<openraft::raft::VoteResponse<Types>> {
         let voters: Vec<_> = self.raft.voter_ids().collect();
         seating::departure::reject_departed(&*self.replica.lock()?, self.local, Some(sender))?;
+        if sender != self.creator
+            && third::local_route(&self.replica, &*self.replica.lock()?)?
+                .is_some_and(|route| route.departure.is_some())
+        {
+            return Err(invalid("retired recovery candidate"));
+        }
         if sender == self.local || request.vote.leader_id.node_id != sender {
             return Err(invalid("incorrect authenticated candidate"));
         }
@@ -238,6 +244,24 @@ impl LearnerReplication {
         let third = store::meta::<JoinedMember>(&*self.replica.lock()?, "third_member")?;
         let mut prefix_len = request.entries.len();
         for (position, entry) in request.entries.iter().enumerate() {
+            if let Some(raw) = entry.payload.registration_source()? {
+                if route.is_none() {
+                    return Err(invalid("missing fresh registration route"));
+                }
+                if store::meta::<LogId>(&*self.replica.lock()?, "applied")?
+                    .is_none_or(|k| k.index.saturating_add(1) < entry.log_id.index)
+                {
+                    prefix_len = position;
+                    break;
+                }
+                third::check_retained_registration(
+                    &self.replica,
+                    &*self.replica.lock()?,
+                    entry,
+                    raw,
+                )?;
+                continue;
+            }
             if let Some(packet) = entry.payload.leave_source()? {
                 // A reconnecting learner may receive the Leave and its dependencies
                 // together. Acknowledge only the prefix Raft actually accepted; retry

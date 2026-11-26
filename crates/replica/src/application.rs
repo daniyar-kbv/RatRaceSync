@@ -429,6 +429,14 @@ impl Replica {
                 &StoredMembershipOf::<Types>::new(Some(e.log_id), m),
             )?;
             reply
+        } else if let Some(raw) = e.payload.registration_source()? {
+            let members = learner::third::verify_registration(self, tx, e, raw)?;
+            put(
+                tx,
+                "membership",
+                &StoredMembershipOf::<Types>::new(Some(e.log_id), members),
+            )?;
+            Reply::Protocol
         } else if let Some(join) = e.payload.join_command()? {
             let m = e
                 .payload

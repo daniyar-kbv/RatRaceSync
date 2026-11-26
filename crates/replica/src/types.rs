@@ -93,7 +93,23 @@ impl Source {
             .combined_command()?
             .filter(|raw| crate::seating::departure::is_source(raw)))
     }
+    pub(crate) fn registration(route: &[u8]) -> Self {
+        Self::blank().with_normal(Signed(crate::wire::message(&[
+            (1, b"RatRaceSync/learner/registration/v1"),
+            (2, route),
+        ])))
+    }
+    pub(crate) fn registration_source(&self) -> io::Result<Option<&[u8]>> {
+        Ok(self
+            .combined_command()?
+            .and_then(|raw| crate::wire::fields(raw, &[1, 2]).ok())
+            .filter(|f| f[&1] == b"RatRaceSync/learner/registration/v1")
+            .map(|f| f[&2]))
+    }
     pub(crate) fn join_command(&self) -> io::Result<Option<&[u8]>> {
+        if self.registration_source()?.is_some() {
+            return Ok(None);
+        }
         Ok(self
             .combined_command()?
             .filter(|raw| !crate::seating::departure::is_source(raw)))

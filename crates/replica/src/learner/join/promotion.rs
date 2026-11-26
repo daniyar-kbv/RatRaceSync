@@ -111,12 +111,29 @@ impl Replica {
             .query([applied.index.to_be_bytes()])
             .map_err(io::Error::other)?;
         let mut leaving = false;
+        let mut registered = false;
         while let Some(row) = rows.next().map_err(io::Error::other)? {
             let entry =
                 store::decode::<Entry>(&row.get::<_, Vec<u8>>(1).map_err(io::Error::other)?)?;
             let Some(m) = entry.payload.check_members()? else {
                 continue;
             };
+            if let Some(raw) = entry.payload.registration_source()? {
+                if leaving
+                    || promoted
+                    || registered
+                    || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?
+                        != entry.log_id.index.to_be_bytes()
+                {
+                    return Err(invalid("unexpected pending learner registration"));
+                }
+                third::check_retained_registration(self, db, &entry, raw)?;
+                registered = true;
+                continue;
+            }
+            if registered {
+                return Err(invalid("membership after pending registration"));
+            }
             if let Some(raw) = entry.payload.leave_source()? {
                 if leaving
                     || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?

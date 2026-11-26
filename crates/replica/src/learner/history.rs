@@ -28,7 +28,12 @@ pub(super) fn membership_entry(
         params![idx.to_be_bytes(),inclusive],|r|r.get(0)).optional().map_err(io::Error::other)?;
     entry.map(|bytes| store::decode(&bytes)).transpose()
 }
-fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Vec<u8>>> {
+fn config_at(
+    r: &Replica,
+    db: &Connection,
+    idx: u64,
+    inclusive: bool,
+) -> io::Result<Option<Vec<u8>>> {
     membership_entry(db, idx, inclusive)?
         .map(|entry| {
             let members = entry
@@ -52,6 +57,11 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                             vec![voters.iter().map(|v| v.node).collect()],
                             prior.non_write_voter_ids(),
                         )
+            } else if let Some(raw) = entry.payload.registration_source()? {
+                let route = third::RecoveryRoute::parse(r, &creator, raw)?;
+                let left = seating::departure::last_guest_at(db, entry.log_id.index)?;
+                left.is_some_and(|d| Some(d.log_id) == route.departure && d.node == route.joined)
+                    && members == route.singleton_target(creator.node)
             } else if let Some(third) = third_at(db, entry.log_id.index)? {
                 let voters = super::quorum::voters(db, entry.log_id.index)?;
                 entry.log_id == third.log_id
@@ -115,11 +125,12 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
     }
     let genesis = store::meta::<SignedGenesis>(db, "signed_genesis")?
         .ok_or(invalid("missing historical genesis"))?;
-    let predecessor = config_at(db, index, false)?;
+    let predecessor = config_at(r, db, index, false)?;
     if predecessor.is_none() != (index == 0) {
         return Err(invalid("missing predecessor membership"));
     }
-    let effective = config_at(db, index, true)?.ok_or(invalid("missing effective membership"))?;
+    let effective =
+        config_at(r, db, index, true)?.ok_or(invalid("missing effective membership"))?;
     let creator =
         store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing signer binding"))?;
     let binding = if let Some(member) = joined_at(db, index)? {

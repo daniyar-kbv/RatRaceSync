@@ -658,6 +658,7 @@ async fn last_guest_registered_learner_resumes_from_creator_alone() {
     host.raft.shutdown().await.unwrap();
 }
 
+mod registration;
 mod replacement;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

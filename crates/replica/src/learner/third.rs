@@ -4,6 +4,8 @@ use openraft::{
     entry::RaftPayload,
     raft::{AppendEntriesRequest, Precondition},
 };
+mod registration;
+pub(crate) use registration::{check_retained_registration, verify_registration};
 mod transfer;
 pub(super) use transfer::response_body;
 
@@ -12,6 +14,8 @@ const ROUTE: &[u8] = b"RatRaceSync/learner/two-voter-route/v1";
 /// The creator authenticates the second transport identity for bootstrap.
 /// The original two-voter certificate is separately checked against local replay.
 pub(crate) struct RecoveryRoute {
+    pub(super) departure: Option<LogId>,
+    route_hash: [u8; 32],
     learner: ReplicaId,
     learner_key: [u8; 32],
     pub(super) admission: Vec<u8>,
@@ -56,7 +60,13 @@ impl RecoveryRoute {
         if raw.len() > 32768 {
             return Err(invalid("oversized recovery route"));
         }
-        let f = fields(authenticate(raw, &creator.key)?, &[1, 2, 3, 4, 5, 6])?;
+        let body = authenticate(raw, &creator.key)?;
+        let f =
+            fields(body, &[1, 2, 3, 4, 5, 6]).or_else(|_| fields(body, &[1, 2, 3, 4, 5, 6, 7]))?;
+        let departure = f
+            .get(&7)
+            .map(|bytes| store::decode::<LogId>(bytes))
+            .transpose()?;
         let admission = admission_fields(r, f[&2], creator)?;
         let learner_key = fixed(admission[&5])?;
         let learner = ReplicaId(fixed(admission[&6])?);
@@ -71,6 +81,8 @@ impl RecoveryRoute {
             return Err(invalid("invalid recovery admission or voter bindings"));
         }
         Ok(Self {
+            departure,
+            route_hash: Sha256::digest(raw).into(),
             learner,
             learner_key,
             admission: f[&2].to_vec(),
@@ -111,7 +123,10 @@ impl RecoveryRoute {
         sender: ReplicaId,
         req: &AppendEntriesRequest<Types>,
     ) -> io::Result<()> {
-        if ![creator, self.joined].contains(&sender) || req.vote.leader_id.node_id != sender {
+        if (self.departure.is_some() && sender != creator)
+            || ![creator, self.joined].contains(&sender)
+            || req.vote.leader_id.node_id != sender
+        {
             return Err(invalid("unrecognized recovery leader"));
         }
         for e in &req.entries {
@@ -122,7 +137,9 @@ impl RecoveryRoute {
             let Some(m) = e.payload.check_members()? else {
                 continue;
             };
-            let expected = if e.log_id == self.join {
+            let expected = if let Some(raw) = e.payload.registration_source()? {
+                self.matches_registration(raw) && m == self.singleton_target(creator)
+            } else if e.log_id == self.join {
                 e.payload.join_command()?.is_some() && m == join::target(creator, self.joined)
             } else if e.log_id.index < self.join.index {
                 let learners = if e.log_id.index == 0 {
@@ -250,20 +267,33 @@ impl GameNode {
         r.verify_replay(&db)?;
         let m = member(&db)?;
         let cert = history::get(&db, m.log_id.index)?.ok_or(invalid("missing Join certificate"))?;
-        let raw = signed(
-            &message(&[
-                (1, ROUTE),
-                (2, admission),
-                (3, &m.node.0),
-                (4, &m.key),
-                (5, &store::encode(&m.log_id)?),
-                (6, &cert),
-            ]),
-            key,
-        );
+        let mut body = message(&[
+            (1, ROUTE),
+            (2, admission),
+            (3, &m.node.0),
+            (4, &m.key),
+            (5, &store::encode(&m.log_id)?),
+            (6, &cert),
+        ]);
+        let left = seating::departure::last_guest_at(&db, u64::MAX)?;
+        if let Some(left) = &left {
+            wire::field(&mut body, 7, &store::encode(&left.log_id)?);
+        }
+        let raw = signed(&body, key);
         let route = RecoveryRoute::parse(r, &creator, &raw)?;
         route.verify_historical_join(r, &db, m.log_id)?;
-        require_open_place(&db)?;
+        if route.departure.is_some() {
+            route.check_departure(&db)?;
+            let m = history::membership(&db)?;
+            if !(m.log_id() == &route.departure
+                && m.membership().non_write_voter_ids().next().is_none())
+                && !route.is_registered(&db, &creator)?
+            {
+                return Err(invalid("another registration owns the vacancy"));
+            }
+        } else {
+            require_open_place(&db)?;
+        }
         let slot = format!("issued_recovery_route_{}", route.learner);
         if let Some(saved) = store::meta::<Vec<u8>>(&db, &slot)? {
             if saved != raw {
@@ -288,7 +318,9 @@ impl GameNode {
         let r = &self.replica;
         let db = r.lock()?;
         let route = RecoveryRoute::parse(r, &creator(&db)?, raw)?;
-        if Some(route.joined) != r.local_node || &route.joined_key != key.verifying_key().as_bytes()
+        if route.departure.is_some()
+            || Some(route.joined) != r.local_node
+            || &route.joined_key != key.verifying_key().as_bytes()
         {
             return Err(invalid("joined voter support required"));
         }
@@ -299,7 +331,7 @@ impl GameNode {
         seating::departure::reject_departed(&db, route.joined, None)?;
         Ok(signed(&support(raw), key))
     }
-    /// Add only a replication target. The two-member voting quorum stays intact.
+    /// Register a replication target under the current voters, preserving the voting quorum.
     pub async fn admit_recovery_learner(
         &self,
         raw: &[u8],
@@ -310,31 +342,61 @@ impl GameNode {
             .await
             .map_err(io::Error::other)?;
         let r = &self.replica;
-        let (members, high, prior) = {
+        let (members, high, prior, source) = {
             let db = r.lock()?;
             let creator = creator(&db)?;
             let route = RecoveryRoute::parse(r, &creator, raw)?;
-            if authenticate(confirmation, &route.joined_key)? != support(raw) {
-                return Err(invalid(
-                    "recovery capability differs from proposed registration",
-                ));
-            }
-            require_open_place(&db)?;
+
             r.require_lobby_genesis(&db)?;
             r.verify_replay(&db)?;
             route.verify_historical_join(r, &db, route.join)?;
             let m = history::membership(&db)?;
             let prior = m.log_id().ok_or(invalid("missing effective membership"))?;
-            let voters = join::target(creator.node, route.joined);
-            let target =
-                Members::new_with_defaults(voters.get_joint_config().clone(), [route.learner]);
-            if m.membership() == &target {
-                return Ok(prior);
+            if let Some(left) = route.departure {
+                route.check_departure(&db)?;
+                let issued = store::meta::<Vec<u8>>(
+                    &db,
+                    &format!("issued_recovery_route_{}", route.learner),
+                )?;
+                if r.local_node != Some(creator.node)
+                    || !confirmation.is_empty()
+                    || issued.as_deref() != Some(raw)
+                {
+                    return Err(invalid("unknown singleton registration"));
+                }
+                if route.is_registered(&db, &creator)? {
+                    return Ok(prior);
+                }
+                if left != prior
+                    || m.membership()
+                        != &Members::new_with_defaults(vec![[creator.node].into()], [])
+                {
+                    return Err(invalid("singleton registration superseded"));
+                }
+                (
+                    route.singleton_target(creator.node),
+                    history::boundary(&db)?,
+                    prior,
+                    Source::registration(raw),
+                )
+            } else {
+                if authenticate(confirmation, &route.joined_key)? != support(raw) {
+                    return Err(invalid(
+                        "recovery capability differs from proposed registration",
+                    ));
+                }
+                require_open_place(&db)?;
+                let voters = join::target(creator.node, route.joined);
+                let target =
+                    Members::new_with_defaults(voters.get_joint_config().clone(), [route.learner]);
+                if m.membership() == &target {
+                    return Ok(prior);
+                }
+                if m.membership() != &voters {
+                    return Err(invalid("another learner or voter configuration is active"));
+                }
+                (target, history::boundary(&db)?, prior, Source::blank())
             }
-            if m.membership() != &voters {
-                return Err(invalid("another learner or voter configuration is active"));
-            }
-            (target, history::boundary(&db)?, prior)
         };
         if !self.voting_history_complete(high)? {
             return Err(invalid("predecessor history handoff pending"));
@@ -343,7 +405,7 @@ impl GameNode {
             .raft
             .append_membership(
                 members,
-                Source::blank(),
+                source,
                 [
                     Precondition::CommittedLeaderId {
                         committed_leader_id: high.leader_id,
