@@ -94,7 +94,7 @@ impl GameNode {
     }
 }
 
-fn voters(db: &Connection, index: u64) -> io::Result<Vec<Creator>> {
+pub(super) fn voters(db: &Connection, index: u64) -> io::Result<Vec<Creator>> {
     let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
     let joined =
         history::joined_at(db, index)?.ok_or(invalid("Join has not applied at this checkpoint"))?;
@@ -112,6 +112,9 @@ fn voters(db: &Connection, index: u64) -> io::Result<Vec<Creator>> {
             key: m.key,
             node: m.node,
         });
+    }
+    if let Some(d) = seating::departure::left_at(db, index)? {
+        voters.retain(|v| v.node != d.node);
     }
     voters.sort_by_key(|v| v.node);
     Ok(voters)
@@ -212,6 +215,11 @@ impl Learner {
         let db = self.node.replica.lock()?;
         self.node.replica.require_lobby_genesis(&db)?;
         self.node.replica.verify_replay(&db)?;
+        if seating::departure::locally_retired(&db)?
+            || seating::departure::left_at(&db, u64::MAX)?.is_some_and(|d| d.node == self.id)
+        {
+            return Err(invalid("local member has left"));
+        }
         let member = join::member_for(&db, self.id)?.ok_or(invalid("learner has not joined"))?;
         if member.actor != self.actor || member.node != self.id || member.key != self.key {
             return Err(invalid("joined incarnation differs from installation"));

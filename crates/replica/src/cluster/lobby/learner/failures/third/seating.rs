@@ -1,6 +1,7 @@
 use super::*;
 mod cancellation;
 mod changes;
+mod departure;
 mod history;
 mod readiness;
 mod resize;

@@ -100,12 +100,24 @@ impl Replica {
         let mut rows = query
             .query([applied.index.to_be_bytes()])
             .map_err(io::Error::other)?;
+        let mut leaving = false;
         while let Some(row) = rows.next().map_err(io::Error::other)? {
             let entry =
                 store::decode::<Entry>(&row.get::<_, Vec<u8>>(1).map_err(io::Error::other)?)?;
             let Some(m) = entry.payload.check_members()? else {
                 continue;
             };
+            if let Some(raw) = entry.payload.leave_source()? {
+                if leaving
+                    || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?
+                        != entry.log_id.index.to_be_bytes()
+                {
+                    return Err(invalid("invalid pending Leave"));
+                }
+                seating::departure::check_retained(self, db, &entry, raw)?;
+                leaving = true;
+                continue;
+            }
             if promoted
                 || row.get::<_, [u8; 8]>(0).map_err(io::Error::other)?
                     != entry.log_id.index.to_be_bytes()

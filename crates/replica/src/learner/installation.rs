@@ -52,16 +52,14 @@ pub(crate) fn cancellation_generation(
 ) -> io::Result<Option<catalog::cancellation::CancellationGeneration>> {
     let s = read(db)?;
     let (creator, proof, format) = invitation(&s.session, &s.invitation)?;
-    Ok(
-        (s.prepared && format == lobby::LobbyFormat::Cancellable).then_some(
-            catalog::cancellation::CancellationGeneration {
-                session: s.session,
-                creator,
-                node: s.id,
-                pin: proof.fingerprint,
-            },
-        ),
-    )
+    Ok((s.prepared && format.cancellable()).then_some(
+        catalog::cancellation::CancellationGeneration {
+            session: s.session,
+            creator,
+            node: s.id,
+            pin: proof.fingerprint,
+        },
+    ))
 }
 pub(crate) fn check_cancellation_binding(
     catalog: &Connection,
@@ -72,7 +70,7 @@ pub(crate) fn check_cancellation_binding(
     let s = read(catalog)?;
     let (creator, proof, format) = invitation(&s.session, &s.invitation)?;
     if !s.prepared
-        || format != lobby::LobbyFormat::Cancellable
+        || !format.cancellable()
         || s.session != r.session
         || Some(s.id) != r.local_node
         || proof.fingerprint != *root
@@ -274,19 +272,21 @@ impl InstallationCatalog {
         }
         let tx = self.db.transaction().map_err(io::Error::other)?;
         let version = database_version(&tx)?;
-        if version == 4 {
+        if version >= 4 {
+            let query = if version == 5 {
+                "SELECT EXISTS(SELECT 1 FROM closed_game WHERE session=?1
+                 UNION ALL SELECT 1 FROM departed_game WHERE session=?1)"
+            } else {
+                "SELECT EXISTS(SELECT 1 FROM closed_game WHERE session=?)"
+            };
             let closed: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM closed_game WHERE session=?)",
-                    [session],
-                    |row| row.get(0),
-                )
+                .query_row(query, [session], |row| row.get(0))
                 .map_err(io::Error::other)?;
             if closed {
                 return Err(invalid("session is closed on this installation"));
             }
         }
-        if version == 2 || (version == 4 && !catalog::has_active_learner(&tx)?) {
+        if version == 2 || (version >= 4 && !catalog::has_active_learner(&tx)?) {
             let occupied: bool = tx
                 .query_row("SELECT EXISTS(SELECT 1 FROM participation)", [], |r| {
                     r.get(0)

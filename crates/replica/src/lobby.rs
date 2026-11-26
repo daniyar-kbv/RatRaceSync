@@ -19,6 +19,7 @@ pub(crate) enum LobbyFormat {
     Resizable,
     DreamReady,
     Cancellable,
+    Departure,
 }
 
 impl LobbyFormat {
@@ -33,24 +34,36 @@ impl LobbyFormat {
                 | Self::Resizable
                 | Self::DreamReady
                 | Self::Cancellable
+                | Self::Departure
         )
     }
     pub(crate) fn seat_history(self) -> bool {
         matches!(
             self,
-            Self::SeatChanges | Self::Resizable | Self::DreamReady | Self::Cancellable
+            Self::SeatChanges
+                | Self::Resizable
+                | Self::DreamReady
+                | Self::Cancellable
+                | Self::Departure
         )
     }
     pub(crate) fn resizable(self) -> bool {
-        matches!(self, Self::Resizable | Self::DreamReady | Self::Cancellable)
+        matches!(
+            self,
+            Self::Resizable | Self::DreamReady | Self::Cancellable | Self::Departure
+        )
     }
     pub(crate) fn preferences(self) -> bool {
-        matches!(self, Self::DreamReady | Self::Cancellable)
+        matches!(self, Self::DreamReady | Self::Cancellable | Self::Departure)
+    }
+    pub(crate) fn cancellable(self) -> bool {
+        matches!(self, Self::Cancellable | Self::Departure)
     }
     pub fn profile(self) -> &'static [u8] {
         match self {
             Self::Legacy => b"RatRaceSync/Classic101/lobby/v1",
             Self::SemanticLinks => b"RatRaceSync/Classic101/lobby/v2",
+            Self::Departure => b"RatRaceSync/Classic101/lobby/v8",
             Self::Cancellable => b"RatRaceSync/Classic101/lobby/v7",
             Self::DreamReady => b"RatRaceSync/Classic101/lobby/v6",
             Self::Resizable => b"RatRaceSync/Classic101/lobby/v5",
@@ -67,6 +80,7 @@ impl LobbyFormat {
             Self::Resizable,
             Self::DreamReady,
             Self::Cancellable,
+            Self::Departure,
         ]
         .into_iter()
         .find(|f| f.profile() == bytes)
@@ -426,7 +440,8 @@ impl Replica {
             | LobbyFormat::SeatChanges
             | LobbyFormat::Resizable
             | LobbyFormat::DreamReady
-            | LobbyFormat::Cancellable => {
+            | LobbyFormat::Cancellable
+            | LobbyFormat::Departure => {
                 let facts = created.semantic_facts();
                 let sequence = seq.to_be_bytes();
                 let operation = 201u16.to_be_bytes();

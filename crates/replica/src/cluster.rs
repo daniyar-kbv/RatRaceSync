@@ -93,6 +93,13 @@ impl RaftNetworkV2<Types> for Peer {
             if let Some(paused) = self.bus.6.lock().unwrap().as_ref()
                 && r.entries.iter().any(|entry| {
                     entry.payload.bytes.strip_prefix(&[1]) == Some(paused.command.as_slice())
+                        || entry
+                            .payload
+                            .leave_source()
+                            .ok()
+                            .flatten()
+                            .and_then(|p| wire::fields(p, &[1, 2, 3, 4]).ok())
+                            .is_some_and(|f| f[&2] == paused.command)
                 })
             {
                 paused.attempted.notify_one();

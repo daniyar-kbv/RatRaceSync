@@ -420,7 +420,16 @@ impl Replica {
         let k = log_key(e.log_id);
         let src = &e.payload.bytes;
         let digest = Sha256::digest(src);
-        let reply = if let Some(join) = e.payload.join_command()? {
+        let reply = if let Some(packet) = e.payload.leave_source()? {
+            let (raw, m) = seating::departure::verify_entry(self, tx, e, packet)?;
+            let reply = self.apply_seat(tx, e.log_id, raw, &digest, true)?;
+            put(
+                tx,
+                "membership",
+                &StoredMembershipOf::<Types>::new(Some(e.log_id), m),
+            )?;
+            reply
+        } else if let Some(join) = e.payload.join_command()? {
             let m = e
                 .payload
                 .check_members()?
@@ -433,7 +442,10 @@ impl Replica {
             )?;
             Reply::Receipt(receipt)
         } else if let Some(m) = e.payload.check_members()? {
-            if self.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+            if self
+                .lobby_format
+                .is_some_and(lobby::LobbyFormat::cancellable)
+            {
                 seating::cancellation::require_open(tx, u64::MAX)?;
             }
             let mut stmt = tx
@@ -452,7 +464,9 @@ impl Replica {
                     let prior = previous.membership();
                     let roster_matches =
                         if let Some(member) = meta::<JoinedMember>(tx, "first_member")? {
-                            learner::third::registration(&m, creator.node, member.node)
+                            // This registration admits the third installation before its first Join.
+                            meta::<JoinedMember>(tx, "third_member")?.is_none()
+                                && learner::third::registration(&m, creator.node, member.node)
                         } else {
                             m.voter_ids().eq([creator.node]) && m.non_write_voter_ids().count() == 1
                         };
@@ -494,7 +508,7 @@ impl Replica {
         } else if let Some(raw) = src.strip_prefix(&[1]) {
             if self.lobby_format.is_some() {
                 if seating::is_seat_command(raw) {
-                    self.apply_seat(tx, e.log_id, raw, &digest)?
+                    self.apply_seat(tx, e.log_id, raw, &digest, false)?
                 } else {
                     self.apply_lobby(tx, &k, raw, &digest)?
                 }

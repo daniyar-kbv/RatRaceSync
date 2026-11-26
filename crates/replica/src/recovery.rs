@@ -50,7 +50,7 @@ impl Replica {
             "SELECT * FROM receipt ORDER BY seq",
             "SELECT * FROM participant ORDER BY actor",
             "SELECT * FROM certificate ORDER BY actor,position",
-            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby','finance_open','first_member','third_member','seat_claims','setup_revision','cancelled_at') ORDER BY name",
+            "SELECT name,value FROM meta WHERE name IN ('applied','membership','genesis_log','lobby','finance_open','first_member','third_member','seat_claims','setup_revision','cancelled_at','departed_member') ORDER BY name",
         ] {
             if !same_rows(db, &replay, sql).map_err(io::Error::other)? {
                 return Err(invalid(

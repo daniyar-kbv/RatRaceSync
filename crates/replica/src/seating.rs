@@ -1,5 +1,6 @@
 //! Signed seat commands against committed, public lobby occupancy.
 pub(crate) mod cancellation;
+pub(crate) mod departure;
 mod effect;
 mod preference;
 pub use preference::{LobbyIntent, LobbyPreference, OwnLobbyPreference, OwnPreferenceRead};
@@ -55,7 +56,7 @@ impl SeatCommandGuard {
         ]);
         match &self.material {
             Dependencies::Occupancy(m) => m.append_guard(&mut bytes),
-            Dependencies::Cancel {
+            Dependencies::Membership {
                 setup,
                 configuration,
             } => {
@@ -96,13 +97,17 @@ impl SeatCommandGuard {
                 &[&self.dependency_scope(request, m)],
             );
         }
-        if let Dependencies::Cancel {
+        if let Dependencies::Membership {
             setup,
             configuration,
         } = &self.material
         {
             return hash(
-                b"cancel-lobby-intent/v1",
+                if tag == 209 {
+                    b"leave-lobby-intent/v1"
+                } else {
+                    b"cancel-lobby-intent/v1"
+                },
                 &[
                     &self.profile,
                     &self.session,
@@ -114,7 +119,7 @@ impl SeatCommandGuard {
                     &self.layout.to_be_bytes(),
                     &setup.to_be_bytes(),
                     configuration,
-                    &210u16.to_be_bytes(),
+                    &(tag as u16).to_be_bytes(),
                 ],
             );
         }
@@ -214,6 +219,7 @@ fn member(db: &Connection, actor: &[u8], index: u64) -> io::Result<(ReplicaId, [
         if let Some(joined) = store::meta::<JoinedMember>(db, name)?
             && joined.actor == actor
             && joined.log_id.index <= index
+            && !departure::left_at(db, index)?.is_some_and(|left| left.node == joined.node)
         {
             return Ok((joined.node, joined.key));
         }
@@ -228,6 +234,7 @@ enum TableAction {
     Occupancy(SeatAction),
     Resize(LobbyCapacity),
     Cancel,
+    Leave,
     Preference(LobbyPreference),
 }
 #[derive(Clone, Eq, PartialEq)]
@@ -235,19 +242,23 @@ enum Dependencies {
     Legacy,
     Occupancy(Material),
     Resize(u64),
-    Cancel { setup: u64, configuration: [u8; 32] },
+    Membership { setup: u64, configuration: [u8; 32] },
     Preference(preference::Material),
 }
 enum Change {
     Occupancy(SeatAction, SeatTransition),
     Resize(resize::Resize),
     Cancel,
+    Leave,
     Preference(preference::Transition),
 }
 impl TableAction {
     fn guard_tags(self, r: &Replica) -> io::Result<&'static [u32]> {
         match self {
-            Self::Cancel if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) => {
+            Self::Leave if r.lobby_format == Some(lobby::LobbyFormat::Departure) => {
+                Ok(&[1, 2, 3, 4, 5, 6])
+            }
+            Self::Cancel if r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) => {
                 Ok(&[1, 2, 3, 4, 5, 6])
             }
             Self::Preference(_) if r.lobby_format.is_some_and(lobby::LobbyFormat::preferences) => {
@@ -282,13 +293,20 @@ impl TableAction {
                 Ok((Change::Occupancy(action, tr), material))
             }
             Self::Preference(action) => preference::evaluate(db, &table, actor, index, action),
-            Self::Cancel => {
-                if actor != state.host {
+            Self::Leave | Self::Cancel => {
+                let leaving = matches!(self, Self::Leave);
+                if leaving {
+                    departure::successors(db, actor, index)?;
+                } else if actor != state.host {
                     return Err(invalid("only the creator can cancel the lobby"));
                 }
                 Ok((
-                    Change::Cancel,
-                    Dependencies::Cancel {
+                    if leaving {
+                        Change::Leave
+                    } else {
+                        Change::Cancel
+                    },
+                    Dependencies::Membership {
                         setup: resize::observed_setup(db, index)?,
                         configuration: cancellation::configuration_at(db, index)?,
                     },
@@ -311,6 +329,7 @@ impl TableAction {
 }
 fn operation(action: TableAction) -> (u32, Option<u8>) {
     match action {
+        TableAction::Leave => (209, None),
         TableAction::Cancel => (210, None),
         TableAction::Preference(action) => preference::operation(action),
         TableAction::Resize(target) => (203, Some(target.count())),
@@ -320,8 +339,12 @@ fn operation(action: TableAction) -> (u32, Option<u8>) {
     }
 }
 fn action(bytes: &[u8]) -> io::Result<TableAction> {
-    for tag in [203, 204, 205, 206, 207, 208, 210] {
+    for tag in [203, 204, 205, 206, 207, 208, 209, 210] {
         if let Ok(operation) = fields(bytes, &[tag]) {
+            if tag == 209 {
+                fields(operation[&tag], &[])?;
+                return Ok(TableAction::Leave);
+            }
             if tag == 210 {
                 fields(operation[&tag], &[])?;
                 return Ok(TableAction::Cancel);
@@ -465,7 +488,9 @@ impl SeatCommand {
     }
     fn current(&self, r: &Replica, db: &Connection) -> io::Result<Option<Change>> {
         let g = &self.guard;
-        if cancellation::at(db, u64::MAX)?.is_some() {
+        if cancellation::at(db, u64::MAX)?.is_some()
+            || departure::left_at(db, u64::MAX)?.is_some_and(|m| m.actor == g.actor)
+        {
             return Ok(None);
         }
         let state = layout_at(db, u64::MAX)?;
@@ -541,6 +566,19 @@ fn archived_seat_command(db: &Connection, record: &[u8]) -> io::Result<Option<Si
             |row| row.get(0),
         )
         .map_err(io::Error::other)?;
+    if source.first() == Some(&3) {
+        let bytes: Vec<u8> = db
+            .query_row(
+                "SELECT l.entry FROM raft_log l JOIN archive a USING(idx) WHERE a.log_id=?",
+                [receipt[&5]],
+                |r| r.get(0),
+            )
+            .map_err(io::Error::other)?;
+        let entry = store::decode::<Entry>(&bytes)?;
+        if let Some(packet) = entry.payload.leave_source()? {
+            return Ok(Some(Signed(fields(packet, &[1, 2, 3, 4])?[&2].to_vec())));
+        }
+    }
     Ok(source
         .strip_prefix(&[1])
         .filter(|raw| is_seat_command(raw))
@@ -626,7 +664,10 @@ impl GameNode {
         let db = r.lock()?;
         r.require_lobby_genesis(&db)?;
         r.verify_replay(&db)?;
-        let (node, public) = member(&db, actor, u64::MAX)?;
+        let index = departure::left_at(&db, u64::MAX)?
+            .filter(|d| d.actor == actor)
+            .map_or(u64::MAX, |d| d.log_id.index - 1);
+        let (node, public) = member(&db, actor, index)?;
         if r.local_node != Some(node) || public != key.verifying_key().to_bytes() {
             return Err(invalid("incorrect local seat signer"));
         }
@@ -774,6 +815,9 @@ impl Replica {
         self.require_lobby_genesis(db)?;
         self.verify_replay(db)?;
         let command = SeatCommand::verify(self, db, raw)?;
+        if matches!(command.guard.action, TableAction::Leave) {
+            return Err(invalid("Leave requires source-bearing membership"));
+        }
         if let Some(reply) = command.original(db)? {
             return Ok(Some(reply));
         }
@@ -798,8 +842,12 @@ impl Replica {
         k: LogId,
         raw: &[u8],
         source_digest: &[u8],
+        combined_leave: bool,
     ) -> io::Result<Reply> {
         let command = SeatCommand::verify(self, db, raw)?;
+        if matches!(command.guard.action, TableAction::Leave) != combined_leave {
+            return Err(invalid("invalid Leave payload kind"));
+        }
         if let Some(reply) = command.original(db)? {
             return Ok(reply);
         }
@@ -825,6 +873,7 @@ impl Replica {
                 facts,
             } = match change {
                 Change::Occupancy(action, tr) => effect::commit(self, db, k.index, g, action, tr)?,
+                Change::Leave => departure::commit(self, db, k, g)?,
                 Change::Cancel => cancellation::commit(self, db, k, &command)?,
                 Change::Resize(plan) => plan.commit(self, db, k.index, g.layout)?,
                 Change::Preference(tr) => preference::commit(self, db, k.index, g, tr)?,
@@ -857,6 +906,7 @@ impl Replica {
                         203 => b"LobbyCapacityChanged/v1",
                         207 => b"DreamSelected/v1",
                         208 => b"ReadyChanged/v1",
+                        209 => b"LobbyMemberLeft/v1",
                         210 => b"LobbyCancelled/v1",
                         _ => b"SeatChanged/v1",
                     },

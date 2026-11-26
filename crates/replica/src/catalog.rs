@@ -11,6 +11,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::{fs, path::PathBuf, sync::Weak, time::Duration};
 
 pub(crate) mod cancellation;
+mod departure;
 pub(crate) use cancellation::{check_new_inventory, has_learner as has_active_learner};
 
 pub struct CreatorGame {
@@ -86,10 +87,14 @@ impl InstallationCatalog {
                 db.prepare("SELECT request,session,actor,public_key,node,stage,pin FROM participation WHERE slot=1")
                     .map_err(io::Error::other)?;
             }
-            2..=4 => {
+            2..=5 => {
                 Self::reservation(&db)?;
-                if version == 4 {
+                if version >= 4 {
                     cancellation::check_schema(&db)?;
+                    if version == 5 {
+                        db.prepare("SELECT session,node,pin,receipt FROM departed_game")
+                            .map_err(io::Error::other)?;
+                    }
                 }
                 if cancellation::has_learner(&db)? {
                     crate::learner::check_inventory(&db)?;
@@ -285,7 +290,7 @@ impl InstallationCatalog {
         N: RaftNetworkFactory<Types>,
         N::Network: NetSnapshot<Types, SnapshotData = ()>,
     {
-        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::Cancellable)
+        self.create_lobby_for_profile(input, key, config, network, LobbyFormat::Departure)
             .await
     }
 

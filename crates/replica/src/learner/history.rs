@@ -4,10 +4,10 @@ const ROW: &[u8] = b"RatRaceSync/history/row/v2";
 const ISSUE: &[u8] = b"RatRaceSync/history/issue/v2";
 const SIGNER: &[u8] = b"RatRaceSync/history/signer/v2";
 
-pub(super) fn membership(db: &Connection) -> io::Result<StoredMembershipOf<Types>> {
+pub(crate) fn membership(db: &Connection) -> io::Result<StoredMembershipOf<Types>> {
     store::meta(db, "membership")?.ok_or(invalid("missing committed membership"))
 }
-pub(super) fn boundary(db: &Connection) -> io::Result<LogId> {
+pub(crate) fn boundary(db: &Connection) -> io::Result<LogId> {
     let applied = store::meta::<LogId>(db, "applied")?.ok_or(invalid("no applied checkpoint"))?;
     if store::meta::<Option<LogId>>(db, "committed")?.flatten() != Some(applied) {
         return Err(io::Error::new(
@@ -31,7 +31,16 @@ fn config_at(db: &Connection, idx: u64, inclusive: bool) -> io::Result<Option<Ve
                 .ok_or(invalid("invalid historical membership"))?;
             let creator =
                 store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
-            let valid = if let Some(third) = third_at(db, entry.log_id.index)? {
+            let valid = if let Some(d) = seating::departure::left_at(db, entry.log_id.index)? {
+                let voters = super::quorum::voters(db, entry.log_id.index)?;
+                entry.log_id == d.log_id
+                    && entry.payload.leave_source()?.is_some()
+                    && members
+                        == Members::new_with_defaults(
+                            vec![voters.iter().map(|v| v.node).collect()],
+                            [],
+                        )
+            } else if let Some(third) = third_at(db, entry.log_id.index)? {
                 let first = joined_at(db, entry.log_id.index)?
                     .ok_or(invalid("missing predecessor voter"))?;
                 entry.log_id == third.log_id
@@ -111,6 +120,9 @@ pub(super) fn checkpoint(r: &Replica, db: &Connection, index: u64) -> io::Result
         ];
         if let Some(third) = third_at(db, index)? {
             bindings.push((third.node, binding(&third.actor, &third.key, third.node)));
+        }
+        if let Some(d) = seating::departure::left_at(db, index)? {
+            bindings.retain(|(id, _)| *id != d.node);
         }
         bindings.sort_by_key(|x| x.0);
         message(

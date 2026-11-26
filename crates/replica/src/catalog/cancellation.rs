@@ -4,7 +4,7 @@ use crate::seating::cancellation::at;
 pub(crate) fn has_learner(db: &Connection) -> io::Result<bool> {
     match database_version(db)? {
         3 => Ok(true),
-        4 => db
+        4 | 5 => db
             .query_row("SELECT EXISTS(SELECT 1 FROM learner)", [], |r| r.get(0))
             .map_err(io::Error::other),
         _ => Ok(false),
@@ -22,7 +22,7 @@ pub(super) fn reject_closed_create(
     actor: &[u8],
     request: &[u8; 16],
 ) -> io::Result<()> {
-    if database_version(db)? != 4 {
+    if database_version(db)? < 4 {
         return Ok(());
     }
     let closed:bool=db.query_row(
@@ -34,12 +34,23 @@ pub(super) fn reject_closed_create(
     }
     Ok(())
 }
+pub(super) fn ensure_closed_schema(tx: &Connection, version: i32) -> io::Result<()> {
+    if version < 4 {
+        tx.execute_batch("CREATE TABLE closed_game(session BLOB PRIMARY KEY,node BLOB UNIQUE NOT NULL CHECK(length(node)=16),host INTEGER NOT NULL CHECK(host IN(0,1)),
+                pin BLOB NOT NULL CHECK(length(pin)=32),actor BLOB NOT NULL,create_request BLOB,receipt BLOB NOT NULL,creator BLOB NOT NULL) STRICT;
+                PRAGMA user_version=4").map_err(io::Error::other)?;
+        if version == 2 {
+            crate::learner::create_learner_table(tx)?;
+        }
+    }
+    Ok(())
+}
 fn filename(host: bool, node: ReplicaId) -> String {
     let kind = if host { "game" } else { "learner" };
     format!("{kind}-{node}-g1.sqlite")
 }
 pub(crate) fn check_new_inventory(db: &Connection, directory: &Path) -> io::Result<()> {
-    if database_version(db)? != 4 {
+    if database_version(db)? < 4 {
         return ensure_empty_inventory(directory);
     }
     let mut allowed = std::collections::HashSet::from(
@@ -52,7 +63,11 @@ pub(crate) fn check_new_inventory(db: &Connection, directory: &Path) -> io::Resu
         .map(String::from),
     );
     let mut rows = db
-        .prepare("SELECT node,host FROM closed_game")
+        .prepare(if database_version(db)? == 5 {
+            "SELECT node,host FROM closed_game UNION ALL SELECT node,0 FROM departed_game"
+        } else {
+            "SELECT node,host FROM closed_game"
+        })
         .map_err(io::Error::other)?;
     let files = rows
         .query_map([], |r| Ok(filename(r.get(1)?, ReplicaId(r.get(0)?))))
@@ -94,6 +109,15 @@ impl CancellationGeneration {
     }
 }
 
+fn cancellable_format(path: &Path) -> io::Result<LobbyFormat> {
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(io::Error::other)?;
+    match database_version(&db)? {
+        9 => Ok(LobbyFormat::Cancellable),
+        10 => Ok(LobbyFormat::Departure),
+        _ => Err(invalid("unsupported archived lobby")),
+    }
+}
 fn terminal_receipt(game: &Connection) -> io::Result<Option<Vec<u8>>> {
     let Some(k) = at(game, u64::MAX)? else {
         return Ok(None);
@@ -117,7 +141,7 @@ impl InstallationCatalog {
         &self,
         session: &[u8],
     ) -> io::Result<Option<(CancellationGeneration, Vec<u8>)>> {
-        if database_version(&self.db)? != 4 {
+        if database_version(&self.db)? < 4 {
             return Ok(None);
         }
         let row = self
@@ -202,7 +226,7 @@ impl InstallationCatalog {
             &creator,
             id,
             false,
-            Some(LobbyFormat::Cancellable),
+            Some(cancellable_format(&path)?),
         )
         .await?;
         if replica.root(&creator, None)? != Some(pin)
@@ -229,8 +253,9 @@ impl InstallationCatalog {
         } else if let Some(r) = Self::reservation(&self.db)? {
             match (r.pin, r.lobby_command) {
                 (Some(pin), Some(cmd))
-                    if LobbyCommand::verify(&cmd.0, &r.session, &r.creator)?.format
-                        == LobbyFormat::Cancellable =>
+                    if LobbyCommand::verify(&cmd.0, &r.session, &r.creator)?
+                        .format
+                        .cancellable() =>
                 {
                     Some(CancellationGeneration {
                         session: r.session,
@@ -252,13 +277,25 @@ impl InstallationCatalog {
             Some(&g.creator),
             Some(g.node),
             false,
-            Some(LobbyFormat::Cancellable),
+            Some(cancellable_format(&path)?),
         ) {
             Ok(r) => r,
             // A live owner reconciles using its existing handle.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
         };
+        if store::meta::<seating::departure::confirmation::Evidence>(
+            &*r.lock()?,
+            seating::departure::confirmation::LOCAL,
+        )?
+        .is_some()
+        {
+            if r.root(&g.creator, None)? != Some(g.pin) {
+                return Err(invalid("departure generation differs from catalog pin"));
+            }
+            self.reconcile_departure(&r, None)?;
+            return Ok(());
+        }
         if at(&*r.lock()?, u64::MAX)?.is_none() {
             return Ok(());
         }
@@ -283,7 +320,7 @@ impl InstallationCatalog {
     }
 
     fn reconcile_generation(&mut self, replica: &Replica) -> io::Result<Option<Vec<u8>>> {
-        if replica.lobby_format != Some(LobbyFormat::Cancellable) {
+        if replica.lobby_format.is_none_or(|f| !f.cancellable()) {
             return Ok(None);
         }
         let game = replica.lock()?;
@@ -312,7 +349,7 @@ impl InstallationCatalog {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(io::Error::other)?;
         let version = database_version(&tx)?;
-        if version == 4 {
+        if version >= 4 {
             let old: Option<Vec<u8>> = tx
                 .query_row(
                     "SELECT receipt FROM closed_game WHERE session=? AND node=? AND pin=?",
@@ -341,14 +378,7 @@ impl InstallationCatalog {
             crate::learner::check_cancellation_binding(&tx, replica, &game, root)?;
             None
         };
-        if version != 4 {
-            tx.execute_batch("CREATE TABLE closed_game(session BLOB PRIMARY KEY,node BLOB UNIQUE NOT NULL CHECK(length(node)=16),host INTEGER NOT NULL CHECK(host IN(0,1)),
-                pin BLOB NOT NULL CHECK(length(pin)=32),actor BLOB NOT NULL,create_request BLOB,receipt BLOB NOT NULL,creator BLOB NOT NULL) STRICT;
-                PRAGMA user_version=4").map_err(io::Error::other)?;
-            if version == 2 {
-                crate::learner::create_learner_table(&tx)?;
-            }
-        }
+        ensure_closed_schema(&tx, version)?;
         tx.execute(
             "INSERT INTO closed_game VALUES(?,?,?,?,?,?,?,?)",
             params![

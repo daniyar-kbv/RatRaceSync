@@ -82,7 +82,17 @@ impl RaftPayload for Source {
     }
 }
 impl Source {
+    pub(crate) fn leave_source(&self) -> io::Result<Option<&[u8]>> {
+        Ok(self
+            .combined_command()?
+            .filter(|raw| crate::seating::departure::is_source(raw)))
+    }
     pub(crate) fn join_command(&self) -> io::Result<Option<&[u8]>> {
+        Ok(self
+            .combined_command()?
+            .filter(|raw| !crate::seating::departure::is_source(raw)))
+    }
+    fn combined_command(&self) -> io::Result<Option<&[u8]>> {
         if self.bytes.first() != Some(&3) {
             return Ok(None);
         }
@@ -99,7 +109,7 @@ impl Source {
         Ok(Some(raw))
     }
     pub(crate) fn check_members(&self) -> io::Result<Option<Members>> {
-        if self.join_command()?.is_some() {
+        if self.combined_command()?.is_some() {
             return Ok(self.members.clone());
         }
         if let Some(m) = self.members.as_ref() {

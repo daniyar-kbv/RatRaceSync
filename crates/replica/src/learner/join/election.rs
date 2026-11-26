@@ -44,6 +44,9 @@ impl GameNode {
         let Some(membership_id) = *effective.log_id() else {
             return Ok(None);
         };
+        if store::meta::<JoinedMember>(&*self.replica.lock()?, "third_member")?.is_some() {
+            return Ok(None);
+        }
         if effective.membership().voter_ids().count() != 2
             || effective
                 .membership()

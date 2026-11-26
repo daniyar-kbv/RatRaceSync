@@ -22,7 +22,7 @@ pub(super) fn commit(
     command: &SeatCommand,
 ) -> io::Result<effect::Effect> {
     let g = &command.guard;
-    let Dependencies::Cancel {
+    let Dependencies::Membership {
         setup,
         configuration,
     } = &g.material
@@ -33,8 +33,11 @@ pub(super) fn commit(
     let seats = Snapshot::at(r, db, &state, u64::MAX)?.view();
     let creator = store::meta::<Creator>(db, "creator")?.ok_or(invalid("missing creator"))?;
     let mut members = vec![(1, creator.actor, creator.node)];
+    let departed = departure::left_at(db, k.index)?;
     for name in ["first_member", "third_member"] {
-        if let Some(m) = store::meta::<JoinedMember>(db, name)? {
+        if let Some(m) = store::meta::<JoinedMember>(db, name)?
+            && departed.as_ref().is_none_or(|left| left.node != m.node)
+        {
             members.push((m.ordinal, m.actor, m.node));
         }
     }
@@ -119,6 +122,19 @@ impl GameNode {
         request: [u8; 16],
         key: &SigningKey,
     ) -> io::Result<Signed> {
+        self.prepare_member_command(actor, witness, request, key, 210)
+    }
+    pub(super) fn prepare_member_command(
+        &self,
+        actor: &[u8],
+        witness: &[u8],
+        request: [u8; 16],
+        key: &SigningKey,
+        tag: u32,
+    ) -> io::Result<Signed> {
+        if actor.len() > 64 || witness.len() > 2048 {
+            return Err(invalid("oversized member command"));
+        }
         fields(witness, &[1, 2, 3, 4, 5, 6])?;
         let r = &self.replica;
         let body = message(&[
@@ -127,7 +143,7 @@ impl GameNode {
             (3, actor),
             (4, &request),
             (5, witness),
-            (12, &message(&[(210, &[])])),
+            (12, &message(&[(tag, &[])])),
         ]);
         let raw = Signed(message(&[(1, &body), (2, &key.sign(&body).to_bytes())]));
         self.reserve_seat_command(raw, request)

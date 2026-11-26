@@ -114,6 +114,10 @@ impl RecoveryRoute {
             return Err(invalid("unrecognized recovery leader"));
         }
         for e in &req.entries {
+            // The replication handler separately verifies departures against the retained prefix.
+            if e.payload.leave_source()?.is_some() {
+                continue;
+            }
             let Some(m) = e.payload.check_members()? else {
                 continue;
             };

@@ -18,6 +18,7 @@ impl Resize {
                 joined += 1;
             }
         }
+        joined -= usize::from(departure::left_at(db, index)?.is_some());
         let order = table
             .seating()
             .resized_order(target, joined)

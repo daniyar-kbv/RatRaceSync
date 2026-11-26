@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-mod history;
+pub(crate) mod history;
 mod join;
 mod quorum;
 pub(crate) mod third;
@@ -70,6 +70,7 @@ pub(crate) fn invitation(
         lobby::LobbyFormat::Resizable,
         lobby::LobbyFormat::DreamReady,
         lobby::LobbyFormat::Cancellable,
+        lobby::LobbyFormat::Departure,
     ]
     .into_iter()
     .find(|f| body[&11] == genesis::profile_manifest(f.profile()))
@@ -150,6 +151,13 @@ impl LearnerReplication {
         source: Option<&[u8]>,
     ) -> io::Result<openraft::raft::VoteResponse<Types>> {
         let voters: Vec<_> = self.raft.voter_ids().collect();
+        if seating::departure::locally_retired(&*self.replica.lock()?)? {
+            return Err(invalid("local voter has left"));
+        }
+        let retired = seating::departure::left_at(&*self.replica.lock()?, u64::MAX)?;
+        if retired.is_some_and(|d| d.node == sender || d.node == self.local) {
+            return Err(invalid("departed voter"));
+        }
         if sender == self.local || request.vote.leader_id.node_id != sender {
             return Err(invalid("incorrect authenticated candidate"));
         }
@@ -203,6 +211,13 @@ impl LearnerReplication {
     ) -> io::Result<openraft::raft::AppendResult<Types>> {
         let route = { third::local_route(&self.replica, &*self.replica.lock()?)? };
         let voters: Vec<_> = self.raft.voter_ids().collect();
+        if seating::departure::locally_retired(&*self.replica.lock()?)? {
+            return Err(invalid("local voter has left"));
+        }
+        let retired = seating::departure::left_at(&*self.replica.lock()?, u64::MAX)?;
+        if retired.is_some_and(|d| d.node == authenticated_sender || d.node == self.local) {
+            return Err(invalid("departed replication participant"));
+        }
         let eligible_sender = if voters.len() == 3 {
             voters.contains(&authenticated_sender) && self.local != authenticated_sender
         } else {
@@ -229,6 +244,15 @@ impl LearnerReplication {
         }
         let third = store::meta::<JoinedMember>(&*self.replica.lock()?, "third_member")?;
         for entry in &request.entries {
+            if let Some(packet) = entry.payload.leave_source()? {
+                seating::departure::check_retained(
+                    &self.replica,
+                    &*self.replica.lock()?,
+                    entry,
+                    packet,
+                )?;
+                continue;
+            }
             if third
                 .as_ref()
                 .is_some_and(|m| entry.log_id.index >= m.log_id.index)
@@ -256,6 +280,9 @@ impl LearnerReplication {
                 .map_err(io::Error::other);
         }
         for entry in &request.entries {
+            if entry.payload.leave_source()?.is_some() {
+                continue;
+            }
             if entry
                 .payload
                 .check_members()?
@@ -400,7 +427,7 @@ impl CreatorGame {
         }
         let db = r.lock()?;
         r.require_lobby_genesis(&db)?;
-        if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+        if r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) {
             r.verify_replay(&db)?;
             seating::cancellation::require_open(&db, u64::MAX)?;
         }
@@ -438,7 +465,7 @@ impl CreatorGame {
                     "learner admission requires the original lobby host",
                 ));
             }
-            if r.lobby_format == Some(lobby::LobbyFormat::Cancellable) {
+            if r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) {
                 r.verify_replay(&tx)?;
                 seating::cancellation::require_open(&tx, u64::MAX)?;
             }
@@ -459,16 +486,16 @@ impl CreatorGame {
             if !present && m.membership().non_write_voter_ids().next().is_some() {
                 return Err(invalid("different learner already registered"));
             }
-            let conditional = if !present && r.lobby_format == Some(lobby::LobbyFormat::Cancellable)
-            {
-                Some((
-                    Members::new_with_defaults(m.membership().get_joint_config().clone(), [id]),
-                    history::boundary(&tx)?,
-                    m.log_id().ok_or(invalid("missing membership"))?,
-                ))
-            } else {
-                None
-            };
+            let conditional =
+                if !present && r.lobby_format.is_some_and(lobby::LobbyFormat::cancellable) {
+                    Some((
+                        Members::new_with_defaults(m.membership().get_joint_config().clone(), [id]),
+                        history::boundary(&tx)?,
+                        m.log_id().ok_or(invalid("missing membership"))?,
+                    ))
+                } else {
+                    None
+                };
             tx.commit().map_err(io::Error::other)?;
             if present {
                 return Ok(());

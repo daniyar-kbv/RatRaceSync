@@ -41,13 +41,13 @@ pub(super) struct Material {
     revision: [u8; 32],
     origin: [u8; 32],
 }
-struct History {
+pub(super) struct History {
     dream: Option<DreamId>,
     dream_index: Option<u64>,
-    ready: bool,
-    ack: Option<u64>,
+    pub(super) ready: bool,
+    pub(super) ack: Option<u64>,
 }
-fn history(db: &Connection, actor: &[u8], index: u64) -> io::Result<History> {
+pub(super) fn history(db: &Connection, actor: &[u8], index: u64) -> io::Result<History> {
     let at = index.to_be_bytes();
     let dream = db
         .query_row(
@@ -92,6 +92,9 @@ fn history(db: &Connection, actor: &[u8], index: u64) -> io::Result<History> {
             {
                 current = false;
             }
+        }
+        if departure::left_at(db, index)?.is_some_and(|d| i < d.log_id.index) {
+            current = false;
         }
         if current {
             effective = value;
