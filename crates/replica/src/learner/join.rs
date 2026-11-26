@@ -293,13 +293,11 @@ impl InstallationCatalog {
             }
         }
         if let Some(old) = previous.as_ref().filter(|_| replacing) {
-            // A later layout or the registered voter's departure invalidates the old guard.
+            // A newer layout, or a newer setup for a replacement Join, invalidates the old guard.
             // The original request remains retired once the new intent takes its place.
             if r.lobby_format.is_none_or(|f| !f.resizable())
                 || (old.layout >= lobby.layout_revision
-                    && !(replacement
-                        && old.recovery_route.is_none()
-                        && old.setup < seating::setup_revision(&tx)?))
+                    && !(replacement && old.setup < seating::setup_revision(&tx)?))
                 || original_join(&tx, old)?.is_some()
             {
                 return Err(invalid("another Join owns this reservation"));
@@ -402,6 +400,25 @@ pub(super) fn target(creator: ReplicaId, peer: ReplicaId) -> Members {
 }
 
 impl Intent<'_> {
+    fn check_creator_recovery(
+        &self,
+        r: &Replica,
+        db: &Connection,
+        creator: &Creator,
+        high: LogId,
+    ) -> io::Result<()> {
+        if let Some(route) = self.recovery_route {
+            let saved =
+                store::meta::<Vec<u8>>(db, &format!("issued_recovery_route_{}", self.node))?;
+            if r.local_node != Some(creator.node) || saved.as_deref() != Some(route) {
+                return Err(invalid("unrecognized registered learner"));
+            }
+            if !quorum::history_complete(r, db, high)? {
+                return Err(invalid("predecessor history handoff pending"));
+            }
+        }
+        Ok(())
+    }
     fn validate(&self, r: &Replica, db: &Connection, creator: &Creator) -> io::Result<Transition> {
         let prev = history::membership(db)?;
         let prior = prev
@@ -508,13 +525,6 @@ impl GameNode {
             let change = intent.validate(r, &db, &creator)?;
             intent.verify_approvals(&db, &creator, change.ordinal)?;
             let high = history::boundary(&db)?;
-            if let Some(route) = intent.recovery_route {
-                let saved =
-                    store::meta::<Vec<u8>>(&db, &format!("issued_recovery_route_{}", intent.node))?;
-                if r.local_node != Some(creator.node) || saved.as_deref() != Some(route) {
-                    return Err(invalid("unrecognized registered learner"));
-                }
-            }
             if change.ordinal == 3 && intent.prefix != log_key(high) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -530,11 +540,9 @@ impl GameNode {
             {
                 return Err(invalid("Join lacks matching verified prefix and admission"));
             }
+            intent.check_creator_recovery(r, &db, &creator, high)?;
             (high, change.prior, change.target)
         };
-        if intent.recovery_route.is_some() && !self.voting_history_complete(high)? {
-            return Err(invalid("predecessor history handoff pending"));
-        }
         let raft = self.raft.clone();
         let source = Source::blank().with_normal(Signed(raw.to_vec()));
         let response = Types::spawn(async move {
@@ -603,6 +611,33 @@ pub(super) fn member_for(db: &Connection, node: ReplicaId) -> io::Result<Option<
 }
 
 impl Replica {
+    pub(super) fn check_join_catalog_coverage(
+        &self,
+        db: &Connection,
+        local: ReplicaId,
+        verified: Option<LogId>,
+    ) -> io::Result<()> {
+        // An installation can stage recovery before activation. Signing a Join or
+        // becoming a member requires an independently verified catalog prefix.
+        if let Some(raw) = store::meta::<Vec<u8>>(db, "local_join")? {
+            let intent = parse(self, &raw)?;
+            let index = u64::from_be_bytes(fixed(&intent.prefix[24..])?);
+            if intent.node != local
+                || verified.is_none_or(|k| {
+                    k.index < index || (k.index == index && log_key(k) != intent.prefix)
+                })
+            {
+                return Err(invalid("reserved Join exceeds verified catalog prefix"));
+            }
+        }
+        if let Some(member) = member_for(db, local)?
+            && verified.is_none_or(|k| k.index < member.log_id.index.saturating_sub(1))
+        {
+            return Err(invalid("local membership exceeds verified catalog prefix"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_first_join_source(&self) -> io::Result<bool> {
         let db = self.lock()?;
         if store::meta::<JoinedMember>(&db, "first_member")?.is_some() {

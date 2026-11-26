@@ -187,6 +187,9 @@ impl Replica {
         {
             return Err(invalid("unexpected third voter configuration"));
         }
+        if self.local_node == Some(creator.node) {
+            intent.check_creator_recovery(self, db, &creator, prev)?;
+        }
         if self.local_node == Some(intent.node) {
             let slot = if intent.recovery_route.is_some() {
                 "local_join"

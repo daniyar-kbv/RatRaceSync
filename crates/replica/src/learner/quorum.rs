@@ -338,13 +338,16 @@ impl GameNode {
     pub fn voting_history_complete(&self, k: LogId) -> io::Result<bool> {
         let r = &self.replica;
         let db = r.lock()?;
-        let voters = committed(r, &db, k)?;
-        let Some(record) = store::meta::<Vec<u8>>(&db, &format!("handoff_{}", k.index))? else {
-            return Ok(false);
-        };
-        verify_handoff(r, &db, k, &record, &voters)?;
-        Ok(true)
+        history_complete(r, &db, k)
     }
+}
+pub(super) fn history_complete(r: &Replica, db: &Connection, k: LogId) -> io::Result<bool> {
+    let voters = committed(r, db, k)?;
+    let Some(record) = store::meta::<Vec<u8>>(db, &format!("handoff_{}", k.index))? else {
+        return Ok(false);
+    };
+    verify_handoff(r, db, k, &record, &voters)?;
+    Ok(true)
 }
 fn signatures<'a>(record: &'a [u8], voters: &[Creator]) -> io::Result<(&'a [u8], &'a [u8])> {
     if voters.len() == 1 {

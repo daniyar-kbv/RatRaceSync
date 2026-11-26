@@ -396,6 +396,7 @@ impl InstallationCatalog {
                 0
             };
             history::verify_seals(&replica, &tx, &creator.key, first_unverified..next)?;
+            replica.check_join_catalog_coverage(&tx, state.id, state.verified)?;
             tx.commit().map_err(io::Error::other)?;
         }
         if !state.prepared {

@@ -81,6 +81,38 @@ async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
         .catalog
         .prepare_join(&r.third, &r.identity, request_id, true)
         .unwrap();
+    let earlier_checkpoint: Vec<u8> = r
+        .catalog
+        .db
+        .query_row("SELECT verified FROM learner WHERE slot=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let release = host.seat_release_guard(ACTOR).await.unwrap();
+    host.submit(release.sign(request(184), &key()))
+        .await
+        .unwrap();
+    assert!(host.join_lobby(&raw).await.is_err());
+    host.certify_recovery_tail(&key(), async |_| panic!("retired voter"))
+        .await
+        .unwrap();
+    r.catalog
+        .recover_learner(&mut r.third, &r.identity, async |q| {
+            host.voter_recovery_chunk(&q, &key(), async |_| panic!("retired voter"))
+                .await
+        })
+        .await
+        .unwrap();
+    assert!(
+        r.catalog
+            .prepare_join(&r.third, &r.identity, request_id, true)
+            .is_err()
+    );
+    let request_id = request(185);
+    let raw = r
+        .catalog
+        .prepare_join(&r.third, &r.identity, request_id, true)
+        .expect("fresh Join after a setup-only revision");
     assert_eq!(r.catalog.pending_join(&r.third).unwrap(), raw);
     let offline = r.p.bus.1.lock().unwrap().remove(&id).unwrap();
     assert!(!matches!(
@@ -133,6 +165,26 @@ async fn recovered_learner_joins_after_departure_and_resumes_handoff() {
     let game = hc
         .open_active(Config::default(), bus.clone())
         .await
+        .unwrap();
+    let checkpoint: Vec<u8> = lc
+        .db
+        .query_row("SELECT verified FROM learner WHERE slot=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    for damaged in [None, Some(earlier_checkpoint)] {
+        lc.db
+            .execute("UPDATE learner SET verified=? WHERE slot=1", [damaged])
+            .unwrap();
+        assert!(
+            lc.resume_learner(&identity, Config::default(), bus.clone())
+                .await
+                .is_err(),
+            "joined voter resumed without catalog coverage for its signed prefix"
+        );
+    }
+    lc.db
+        .execute("UPDATE learner SET verified=? WHERE slot=1", [checkpoint])
         .unwrap();
     let mut learner = lc
         .resume_learner(&identity, Config::default(), bus.clone())
@@ -276,12 +328,41 @@ async fn retained_replacement_join_recovers_with_its_original_learner_consent() 
         k
     );
     let identity = r.identity.clone();
+    let game_path = root
+        .path()
+        .join("creator")
+        .join(format!("game-{}-g1.sqlite", r.p.game.creator_node));
     r.third.shutdown().await.unwrap();
     r.p.shutdown().await;
     drop(r);
     let mut hc = InstallationCatalog::open(&root.path().join("creator")).unwrap();
     let mut lc = InstallationCatalog::open(&root.path().join("third")).unwrap();
     let bus = Bus::default();
+    let db = rusqlite::Connection::open(&game_path).unwrap();
+    for name in [
+        format!("handoff_{}", k.index),
+        format!("issued_recovery_route_{id}"),
+    ] {
+        let saved: Vec<u8> = db
+            .query_row("SELECT value FROM meta WHERE name=?", [&name], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        db.execute("DELETE FROM meta WHERE name=?", [&name])
+            .unwrap();
+        assert!(
+            hc.open_active(Config::default(), bus.clone())
+                .await
+                .is_err(),
+            "pending replacement reopened without {name}"
+        );
+        db.execute(
+            "INSERT INTO meta VALUES(?,?)",
+            rusqlite::params![name, saved],
+        )
+        .unwrap();
+    }
+    drop(db);
     let game = hc
         .open_active(Config::default(), bus.clone())
         .await
