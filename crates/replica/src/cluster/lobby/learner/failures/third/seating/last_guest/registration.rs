@@ -181,6 +181,32 @@ async fn fresh_registration_after_leave_races_and_recovers_its_historical_prefix
         .await
         .unwrap();
     let mut catalog = InstallationCatalog::open(&path).unwrap();
+    let generation =
+        rusqlite::Connection::open(path.join(format!("learner-{id}-g1.sqlite"))).unwrap();
+    // Even a creator-signed route for this recipient must name the committed departure.
+    let body = fields(&route, &[1, 2]).unwrap()[&1];
+    let mut prior = fields(body, &[1, 2, 3, 4, 5, 6, 7]).unwrap();
+    prior.remove(&7);
+    let prior = message(&prior.into_iter().collect::<Vec<_>>());
+    let stale_route = message(&[(1, &prior), (2, &key().sign(&prior).to_bytes())]);
+    for replacement in [None, Some(&losing_route), Some(&stale_route)] {
+        generation
+            .execute("DELETE FROM meta WHERE name='local_recovery_route'", [])
+            .unwrap();
+        if let Some(other) = replacement {
+            store::put(&generation, "local_recovery_route", other).unwrap();
+        }
+        assert!(
+            catalog
+                .resume_learner(&identity, Config::default(), bus.clone())
+                .await
+                .is_err(),
+            "partial recovery reopened with a missing or substituted registration route"
+        );
+        assert!(catalog.active_pin().unwrap().is_none());
+    }
+    store::put(&generation, "local_recovery_route", &route).unwrap();
+    drop(generation);
     let mut learner = catalog
         .resume_learner(&identity, Config::default(), bus.clone())
         .await
@@ -220,15 +246,40 @@ async fn fresh_registration_after_leave_races_and_recovers_its_historical_prefix
     }
     bus.1.lock().unwrap().remove(&id);
     learner.shutdown().await.unwrap();
-    game.node.raft.shutdown().await.unwrap();
     drop(learner);
     drop(catalog);
     let mut catalog = InstallationCatalog::open(&path).unwrap();
-    let learner = catalog
+    let mut learner = catalog
         .resume_learner(&identity, Config::default(), Bus::default())
         .await
         .unwrap();
     assert_eq!(catalog.recovered_lobby(&learner).unwrap(), Some(lobby));
     assert!(learner.joined_node().is_err());
+    let host = &game.node;
+    let witness = host.cancellation_witness(ACTOR).await.unwrap();
+    let cancel = host
+        .prepare_cancellation(ACTOR, &witness, super::request(90), &key())
+        .unwrap();
+    let cancelled = super::receipt(host.submit(cancel).await.unwrap());
+    host.certify_recovery_tail(&key(), async |_| panic!("retired voter"))
+        .await
+        .unwrap();
+    bus.1
+        .lock()
+        .unwrap()
+        .insert(id, (game.creator_node, learner.replication()));
+    let recovery = catalog
+        .recover_learner(&mut learner, &identity, async |q| {
+            host.voter_recovery_chunk(&q, &key(), async |_| panic!("retired voter"))
+                .await
+        })
+        .await;
+    assert_eq!(recovery.unwrap_err().to_string(), "lobby cancelled");
+    assert_eq!(
+        catalog.reconcile_learner_cancellation(&learner).unwrap(),
+        Some(cancelled)
+    );
+    assert!(catalog.active_pin().unwrap().is_none());
     learner.shutdown().await.unwrap();
+    game.node.raft.shutdown().await.unwrap();
 }

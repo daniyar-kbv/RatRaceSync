@@ -386,6 +386,15 @@ impl InstallationCatalog {
             if store::meta::<LogId>(&tx, "genesis_log")?.is_some() {
                 replica.require_lobby_genesis(&tx)?;
             }
+            if format == crate::lobby::LobbyFormat::LastGuest {
+                let pinned = third::local_route(&replica, &tx)?;
+                if let Some(entry) = history::membership_entry(&tx, u64::MAX, true)?
+                    && let Some(raw) = entry.payload.registration_source()?
+                    && !pinned.is_some_and(|route| route.matches_registration(raw))
+                {
+                    return Err(invalid("learner route differs from applied registration"));
+                }
+            }
             let first_unverified = if let Some(high) = state.verified {
                 if high.index >= next {
                     return Err(invalid("verified checkpoint exceeds durable cursor"));
@@ -456,6 +465,7 @@ impl InstallationCatalog {
             }
             [1] => {
                 let high = history::boundary(&tx)?;
+                seating::cancellation::require_open(&tx, high.index)?;
                 if history::joined_at(&tx, high.index)?.is_some() != route.is_some() {
                     return Err(invalid("checkpoint signer configuration mismatch"));
                 }
@@ -534,6 +544,7 @@ fn validate_completion(
     binding: &[u8],
     high: LogId,
 ) -> io::Result<()> {
+    seating::cancellation::require_open(db, high.index)?;
     let (request, response) =
         store::meta::<(Vec<u8>, Vec<u8>)>(db, &format!("learner_completion_{}", high.index))?
             .ok_or(invalid("verified learner lost its completion evidence"))?;

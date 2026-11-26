@@ -4,7 +4,7 @@ impl RecoveryRoute {
     pub(crate) fn singleton_target(&self, creator: ReplicaId) -> Members {
         Members::new_with_defaults(vec![[creator].into()], [self.learner])
     }
-    pub(super) fn matches_registration(&self, raw: &[u8]) -> bool {
+    pub(in crate::learner) fn matches_registration(&self, raw: &[u8]) -> bool {
         self.departure.is_some() && self.route_hash == <[u8; 32]>::from(Sha256::digest(raw))
     }
     pub(super) fn check_departure(&self, db: &Connection) -> io::Result<()> {
